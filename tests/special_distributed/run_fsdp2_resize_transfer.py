@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Focused 4-rank to 6-rank FSDP2 model-transfer smoke test.
+"""Focused FSDP2 model-transfer smoke test.
 
 Run with:
     torchrun --standalone --nproc-per-node=6 tests/special_distributed/run_fsdp2_resize_transfer.py
+
+Set ``OLD_WORLD_SIZE=6 NEW_WORLD_SIZE=4`` to exercise actor scale-down.
 """
 
 import os
@@ -43,8 +45,11 @@ def main() -> None:
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
-    old_ranks = list(range(4))
-    new_ranks = list(range(6))
+    old_world_size = int(os.environ.get("OLD_WORLD_SIZE", "4"))
+    new_world_size = int(os.environ.get("NEW_WORLD_SIZE", "6"))
+    old_ranks = list(range(old_world_size))
+    new_ranks = list(range(new_world_size))
+    assert dist.get_world_size() == max(old_world_size, new_world_size)
 
     old_group = dist.new_group(ranks=old_ranks)
     old_model = None
@@ -65,7 +70,7 @@ def main() -> None:
         transfer_group=dist.group.WORLD,
         device=torch.device("cuda", local_rank),
     )
-    assert staged_state is not None
+    assert (staged_state is not None) == (rank in new_ranks)
 
     del old_model
     if rank in old_ranks:
@@ -73,29 +78,34 @@ def main() -> None:
     torch.cuda.empty_cache()
     dist.barrier()
 
-    new_mesh = DeviceMesh.from_group(
-        dist.group.WORLD,
-        device_type="cuda",
-        mesh=torch.arange(len(new_ranks)),
-        mesh_dim_names=["fsdp"],
-    )
-    new_model = _build_model()
-    with torch.no_grad():
-        for parameter in new_model.parameters():
-            parameter.zero_()
-    fully_shard(new_model, mesh=new_mesh)
-    restore_fsdp2_model_state(new_model, staged_state)
+    new_group = dist.new_group(ranks=new_ranks)
+    if rank in new_ranks:
+        new_mesh = DeviceMesh.from_group(
+            new_group,
+            device_type="cuda",
+            mesh=torch.arange(len(new_ranks)),
+            mesh_dim_names=["fsdp"],
+        )
+        new_model = _build_model()
+        with torch.no_grad():
+            for parameter in new_model.parameters():
+                parameter.zero_()
+        fully_shard(new_model, mesh=new_mesh)
+        assert staged_state is not None
+        restore_fsdp2_model_state(new_model, staged_state)
 
-    expected_model = _build_model()
-    expected_state = expected_model.state_dict()
-    actual_state = new_model.state_dict()
-    for name, value in actual_state.items():
-        actual = value.full_tensor() if hasattr(value, "full_tensor") else value
-        torch.testing.assert_close(actual, expected_state[name])
+        expected_model = _build_model()
+        expected_state = expected_model.state_dict()
+        actual_state = new_model.state_dict()
+        for name, value in actual_state.items():
+            actual = value.full_tensor() if hasattr(value, "full_tensor") else value
+            torch.testing.assert_close(actual, expected_state[name])
 
     dist.barrier()
     if rank == 0:
-        print("FSDP2 GPU-direct resize transfer 4->6 passed")
+        print(f"FSDP2 GPU-direct resize transfer {old_world_size}->{new_world_size} passed")
+    if rank in new_ranks:
+        dist.destroy_process_group(new_group)
     dist.destroy_process_group()
 
 

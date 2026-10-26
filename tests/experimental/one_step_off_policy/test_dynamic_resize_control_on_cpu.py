@@ -129,6 +129,29 @@ def test_gpu_direct_model_stage_uses_active_and_target_actor_ranks():
     assert metrics["resize/handoff_model_transfer_bytes"] == 60.0
 
 
+def test_gpu_direct_model_stage_accepts_source_only_ranks_during_actor_scale_down():
+    class _PhysicalWorkerGroup:
+        def stage_actor_model_for_resize(self, old_ranks, new_ranks):
+            assert old_ranks == [0, 1, 2, 3, 4, 5]
+            assert new_ranks == [0, 1, 2, 3]
+            return (
+                [{"status": "staged", "tensor_count": 7, "staged_bytes": 15} for _ in range(4)]
+                + [{"status": "source_only", "tensor_count": 7, "staged_bytes": 0} for _ in range(2)]
+                + [{"status": "non_member", "tensor_count": 0, "staged_bytes": 0} for _ in range(2)]
+            )
+
+    trainer = object.__new__(OneStepOffRayTrainer)
+    trainer._active_dynamic_resize_topology = {"actor_size": 6, "rollout_size": 2}
+    trainer._physical_actor_rollout_wg = _PhysicalWorkerGroup()
+
+    metrics = trainer._stage_gpu_direct_actor_model(actor_target=4)
+
+    assert metrics["resize/handoff_model_transfer_status"] == "staged"
+    assert metrics["resize/handoff_model_transfer_success"] == 0.0
+    assert metrics["resize/handoff_model_transfer_tensor_count"] == 7.0
+    assert metrics["resize/handoff_model_transfer_bytes"] == 60.0
+
+
 def test_dynamic_resize_checkpoint_load_can_skip_actor_for_gpu_direct_restore():
     class _WorkerGroup:
         def __init__(self):

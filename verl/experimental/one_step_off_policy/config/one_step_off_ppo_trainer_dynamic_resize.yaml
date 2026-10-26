@@ -55,7 +55,7 @@ trainer:
       enable: true
     handoff:
       enable: true
-      # Phase-1 direct path: FSDP2, one-dimensional full shard, actor expansion.
+      # Direct path: FSDP2, one-dimensional full shard, actor expansion or scale-down.
       # A full checkpoint is still written before commit and used on failure.
       backend: gpu_direct
       chunk_mb: 256

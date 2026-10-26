@@ -46,12 +46,12 @@ def test_overlap_planner_computes_exact_4_to_6_reshard_plan():
     assert planner.send_row_splits(2) == [0, 0, 0, 2, 1, 0]
     assert planner.send_row_splits(3) == [0, 0, 0, 0, 1, 2]
 
-    assert planner.recv_row_splits(0) == [2, 0, 0, 0, 0, 0]
-    assert planner.recv_row_splits(1) == [1, 1, 0, 0, 0, 0]
-    assert planner.recv_row_splits(2) == [0, 2, 0, 0, 0, 0]
-    assert planner.recv_row_splits(3) == [0, 0, 2, 0, 0, 0]
-    assert planner.recv_row_splits(4) == [0, 0, 1, 1, 0, 0]
-    assert planner.recv_row_splits(5) == [0, 0, 0, 2, 0, 0]
+    assert planner.recv_row_splits(0) == [2, 0, 0, 0]
+    assert planner.recv_row_splits(1) == [1, 1, 0, 0]
+    assert planner.recv_row_splits(2) == [0, 2, 0, 0]
+    assert planner.recv_row_splits(3) == [0, 0, 2, 0]
+    assert planner.recv_row_splits(4) == [0, 0, 1, 1]
+    assert planner.recv_row_splits(5) == [0, 0, 0, 2]
 
     assert planner.overlap(0, 1) == ShardOverlap(
         source_rank=0,
@@ -71,11 +71,29 @@ def test_overlap_planner_computes_exact_4_to_6_reshard_plan():
     )
 
 
+def test_overlap_planner_computes_exact_6_to_4_reshard_plan():
+    planner = FSDPResizeOverlapPlanner(dim_size=12, old_world_size=6, new_world_size=4)
+
+    assert planner.send_row_splits(0) == [2, 0, 0, 0]
+    assert planner.send_row_splits(1) == [1, 1, 0, 0]
+    assert planner.send_row_splits(2) == [0, 2, 0, 0]
+    assert planner.send_row_splits(3) == [0, 0, 2, 0]
+    assert planner.send_row_splits(4) == [0, 0, 1, 1]
+    assert planner.send_row_splits(5) == [0, 0, 0, 2]
+
+    assert planner.recv_row_splits(0) == [2, 1, 0, 0, 0, 0]
+    assert planner.recv_row_splits(1) == [0, 1, 2, 0, 0, 0]
+    assert planner.recv_row_splits(2) == [0, 0, 0, 2, 1, 0]
+    assert planner.recv_row_splits(3) == [0, 0, 0, 0, 1, 2]
+
+
 @pytest.mark.parametrize(
     ("dim_size", "old_world_size", "new_world_size"),
     [
         (12, 4, 6),
         (13, 4, 6),
+        (12, 6, 4),
+        (13, 6, 4),
         (3, 2, 5),
         (0, 4, 6),
     ],
@@ -98,5 +116,5 @@ def test_overlap_planner_handles_uneven_and_empty_target_shards():
 
     assert planner.send_row_splits(0) == [1, 1, 0, 0, 0]
     assert planner.send_row_splits(1) == [0, 0, 1, 0, 0]
-    assert planner.recv_row_splits(3) == [0, 0, 0, 0, 0]
-    assert planner.recv_row_splits(4) == [0, 0, 0, 0, 0]
+    assert planner.recv_row_splits(3) == [0, 0]
+    assert planner.recv_row_splits(4) == [0, 0]

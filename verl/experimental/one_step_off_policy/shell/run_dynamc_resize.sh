@@ -20,6 +20,7 @@ n_gpus_training=$((NUM_GPUS - n_gpus_rollout))
 resize_step=${RESIZE_STEP:-2}
 second_resize_step=$((resize_step + 2))
 shared_pool_gpus=${SHARED_POOL_GPUS:-${NUM_GPUS}}
+initial_split_plan=${INITIAL_SPLIT_PLAN:-"[${n_gpus_training},${n_gpus_rollout}]"}
 first_split_plan=${FIRST_SPLIT_PLAN:-${SPLIT_PLAN:-"[6,2]"}}
 second_split_plan=${SECOND_SPLIT_PLAN:-"[2,6]"}
 total_training_steps=${TOTAL_TRAINING_STEPS:-$((second_resize_step + 2))}
@@ -154,6 +155,8 @@ python3 -m verl.experimental.one_step_off_policy.main_ppo \
   trainer.dynamic_resize.communicator_cache.enable=${COMM_CACHE_ENABLE} \
   trainer.dynamic_resize.communicator_cache.reserve_schedule_topologies=${COMM_CACHE_RESERVE_SCHEDULE} \
   trainer.dynamic_resize.shared_pool.n_gpus_per_node=${shared_pool_gpus} \
+  trainer.dynamic_resize.schedule.stage0.actor_pool.size=${initial_split_plan} \
+  trainer.dynamic_resize.schedule.stage0.rollout_pool.size=${initial_split_plan} \
   +trainer.dynamic_resize.schedule.stage1.step=${resize_step} \
   +trainer.dynamic_resize.schedule.stage1.actor_pool.mode=split \
   +trainer.dynamic_resize.schedule.stage1.actor_pool.from_pool=shared_pool \

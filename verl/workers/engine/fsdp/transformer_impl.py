@@ -223,8 +223,8 @@ class FSDPEngine(BaseEngine):
             raise NotImplementedError("GPU-direct model resize currently requires fsdp_size=-1")
         if old_ranks != list(range(len(old_ranks))) or new_ranks != list(range(len(new_ranks))):
             raise NotImplementedError("GPU-direct model resize currently requires contiguous actor ranks from zero")
-        if len(new_ranks) <= len(old_ranks):
-            raise NotImplementedError("GPU-direct model resize phase 1 supports actor expansion only")
+        if len(new_ranks) == len(old_ranks):
+            raise ValueError("GPU-direct model resize requires different old and new actor sizes")
 
         hostnames: list[str | None] = [None] * torch.distributed.get_world_size()
         torch.distributed.all_gather_object(hostnames, socket.gethostname())

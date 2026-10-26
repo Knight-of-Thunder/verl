@@ -97,10 +97,7 @@ class FSDPResizeOverlapPlanner:
         return [self.overlap(source_rank, target_rank).size for target_rank in range(self.new_world_size)]
 
     def recv_row_splits(self, target_rank: int) -> list[int]:
-        return [
-            self.overlap(source_rank, target_rank).size if source_rank < self.old_world_size else 0
-            for source_rank in range(self.new_world_size)
-        ]
+        return [self.overlap(source_rank, target_rank).size for source_rank in range(self.old_world_size)]
 
 
 def _dtype_name(dtype: torch.dtype) -> str:
@@ -152,7 +149,7 @@ def _build_manifest(model: torch.nn.Module) -> list[dict[str, Any]]:
 
 
 class FSDPResizeStateTransferManager:
-    """Transfer FSDP2 local shards directly from an old mesh to an expanded mesh."""
+    """Transfer FSDP2 local shards directly between differently sized meshes."""
 
     def __init__(
         self,
@@ -162,20 +159,28 @@ class FSDPResizeStateTransferManager:
         transfer_group: dist.ProcessGroup,
         device: torch.device,
     ):
+        if not old_ranks or not new_ranks:
+            raise ValueError("old_ranks and new_ranks must not be empty")
         if old_ranks != list(range(len(old_ranks))) or new_ranks != list(range(len(new_ranks))):
             raise NotImplementedError("FSDP resize transfer currently requires contiguous ranks starting at zero")
-        if not set(old_ranks).issubset(new_ranks):
-            raise NotImplementedError("FSDP resize transfer currently supports actor expansion only")
         self.old_ranks = old_ranks
         self.new_ranks = new_ranks
         self.transfer_group = transfer_group
         self.device = device
         self.global_rank = dist.get_rank()
         self.source_rank = old_ranks[0]
+        self.transfer_world_size = dist.get_world_size(group=transfer_group)
+        expected_transfer_world_size = len(set(old_ranks) | set(new_ranks))
+        if self.transfer_world_size != expected_transfer_world_size:
+            raise ValueError(
+                "transfer group size does not match the source/target rank union: "
+                f"expected {expected_transfer_world_size}, got {self.transfer_world_size}"
+            )
 
     @torch.no_grad()
-    def stage(self, model: torch.nn.Module | None) -> tuple[dict[str, torch.Tensor], dict[str, int]]:
+    def stage(self, model: torch.nn.Module | None) -> tuple[dict[str, torch.Tensor] | None, dict[str, int]]:
         is_old_rank = self.global_rank in self.old_ranks
+        is_new_rank = self.global_rank in self.new_ranks
         if is_old_rank and model is None:
             raise RuntimeError(f"old actor rank {self.global_rank} has no active FSDP model")
 
@@ -191,7 +196,7 @@ class FSDPResizeStateTransferManager:
         if not isinstance(manifest, list) or not manifest:
             raise RuntimeError("received an empty FSDP resize manifest")
 
-        target_state: dict[str, torch.Tensor] = {}
+        target_state: dict[str, torch.Tensor] | None = {} if is_new_rank else None
         staged_bytes = 0
         sharded_tensor_count = 0
         replicated_tensor_count = 0
@@ -203,8 +208,12 @@ class FSDPResizeStateTransferManager:
             else:
                 local_tensor = self._transfer_replicated_tensor(name, item, source_state)
                 replicated_tensor_count += 1
-            target_state[name] = local_tensor
-            staged_bytes += local_tensor.numel() * local_tensor.element_size()
+            if is_new_rank:
+                if local_tensor is None:
+                    raise RuntimeError(f"target actor rank {self.global_rank} did not receive tensor {name}")
+                assert target_state is not None
+                target_state[name] = local_tensor
+                staged_bytes += local_tensor.numel() * local_tensor.element_size()
 
         get_torch_device().synchronize(self.device)
         return target_state, {
@@ -219,7 +228,7 @@ class FSDPResizeStateTransferManager:
         name: str,
         item: dict[str, Any],
         source_state: dict[str, torch.Tensor] | None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
         shape = tuple(int(v) for v in item["shape"])
         if not shape:
             raise RuntimeError(f"cannot Shard(0) scalar tensor {name}")
@@ -252,8 +261,15 @@ class FSDPResizeStateTransferManager:
             send_row_splits = [0] * len(self.new_ranks)
             send_tensor = torch.empty(0, dtype=dtype, device=self.device)
 
-        target_rank = self.new_ranks.index(self.global_rank)
-        recv_row_splits = planner.recv_row_splits(target_rank)
+        send_row_splits.extend([0] * (self.transfer_world_size - len(send_row_splits)))
+        is_new_rank = self.global_rank in self.new_ranks
+        if is_new_rank:
+            target_rank = self.new_ranks.index(self.global_rank)
+            recv_row_splits = planner.recv_row_splits(target_rank)
+        else:
+            target_rank = None
+            recv_row_splits = [0] * len(self.old_ranks)
+        recv_row_splits.extend([0] * (self.transfer_world_size - len(recv_row_splits)))
         send_splits = [row_count * row_width for row_count in send_row_splits]
         recv_splits = [row_count * row_width for row_count in recv_row_splits]
         recv_tensor = torch.empty(sum(recv_splits), dtype=dtype, device=self.device)
@@ -265,6 +281,8 @@ class FSDPResizeStateTransferManager:
             group=self.transfer_group,
         )
 
+        if target_rank is None:
+            return None
         target_interval = planner.target_intervals[target_rank]
         expected_numel = target_interval.size * row_width
         if recv_tensor.numel() != expected_numel:
@@ -279,7 +297,7 @@ class FSDPResizeStateTransferManager:
         name: str,
         item: dict[str, Any],
         source_state: dict[str, torch.Tensor] | None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
         shape = tuple(int(v) for v in item["shape"])
         dtype = _resolve_dtype(str(item["dtype"]))
         if self.global_rank == self.source_rank:
@@ -292,7 +310,7 @@ class FSDPResizeStateTransferManager:
         else:
             full_tensor = torch.empty(shape, dtype=dtype, device=self.device)
         dist.broadcast(full_tensor, src=self.source_rank, group=self.transfer_group)
-        return full_tensor.clone()
+        return full_tensor.clone() if self.global_rank in self.new_ranks else None
 
 
 @torch.no_grad()
