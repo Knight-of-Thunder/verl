@@ -203,6 +203,11 @@ class FSDPEngine(BaseEngine):
         if optimizer is not None:
             optimizer.zero_grad(set_to_none=True)
 
+        from .utils import release_device_mesh
+
+        release_device_mesh(self.device_mesh)
+        release_device_mesh(self.ulysses_device_mesh)
+
         self.module = None
         self.optimizer = None
         self.lr_scheduler = None

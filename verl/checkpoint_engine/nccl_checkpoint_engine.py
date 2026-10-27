@@ -146,7 +146,8 @@ class NCCLCheckpointEngine(CheckpointEngine):
     def finalize(self):
         """Destroy the NCCL process group if rebuild_group is True."""
         if self.rebuild_group:
-            if getattr(self, "rank", -1) >= 0:
+            rank = getattr(self, "rank", None)
+            if rank is not None and rank >= 0:
                 collective.destroy_collective_group(self.group_name)
             self.rank = None
             self.world_size = None

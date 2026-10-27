@@ -23,6 +23,30 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def release_device_mesh(device_mesh) -> None:
+    """Remove private PyTorch mesh-cache entries before destroying its group.
+
+    PyTorch 2.9 keys ``_MeshEnv`` mappings by ``DeviceMesh`` value equality,
+    which does not include the underlying process-group identity. Recreating a
+    mesh for the same ranks can otherwise resolve to an old root mesh whose
+    process group has already been destroyed.
+    """
+    if device_mesh is None:
+        return
+
+    from torch.distributed.device_mesh import _mesh_resources
+
+    child_to_root = _mesh_resources.child_to_root_mapping
+    stale_children = [child for child, root in child_to_root.items() if child == device_mesh or root == device_mesh]
+    for child in stale_children:
+        child_to_root.pop(child, None)
+
+    for mapping_name in ("root_to_flatten_mapping", "flatten_name_to_root_dims"):
+        mapping = getattr(_mesh_resources, mapping_name, None)
+        if mapping is not None:
+            mapping.pop(device_mesh, None)
+
+
 def apply_npu_fsdp_patches(model_config=None):
     """Apply NPU patches for FSDP backend if NPU is available."""
     if is_npu_available:
@@ -50,11 +74,12 @@ def create_device_mesh(world_size, fsdp_size, process_group=None):
             raise NotImplementedError("custom FSDP process groups currently support one-dimensional meshes only")
         from torch.distributed.device_mesh import DeviceMesh
 
+        mesh_dim_name = f"fsdp_{process_group.group_name}"
         return DeviceMesh.from_group(
             process_group,
             device_type=device_name,
             mesh=torch.arange(world_size),
-            mesh_dim_names=["fsdp"],
+            mesh_dim_names=[mesh_dim_name],
         )
 
     if fsdp_size < 0 or fsdp_size >= world_size:
