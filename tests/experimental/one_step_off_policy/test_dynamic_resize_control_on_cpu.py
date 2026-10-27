@@ -108,6 +108,28 @@ def test_dynamic_resize_recipe_enables_gpu_direct_model_and_optimizer_handoff():
     assert cfg.trainer.dynamic_resize.handoff.optimizer_full_state_restore is False
 
 
+def test_dynamic_resize_timing_metrics_expose_resize_breakdown():
+    metrics = OneStepOffRayTrainer._dynamic_resize_timing_metrics(
+        {
+            "dynamic_resize_save_checkpoint": 1.0,
+            "dynamic_resize_destroy_runtime": 2.0,
+            "dynamic_resize_stage_model_gpu": 3.0,
+            "dynamic_resize_rebuild_topology": 4.0,
+            "dynamic_resize_restore_training_state": 5.0,
+            "dynamic_resize_rebuild_runtime": 9.0,
+            "dynamic_resize_update_weights": 6.0,
+        },
+        hard_switch_total_s=21.5,
+    )
+
+    assert metrics["resize/timing_s/save_checkpoint"] == 1.0
+    assert metrics["resize/timing_s/stage_training_state_gpu"] == 3.0
+    assert metrics["resize/timing_s/rebuild_topology"] == 4.0
+    assert metrics["resize/timing_s/restore_training_state"] == 5.0
+    assert metrics["resize/timing_s/rebuild_runtime_total"] == 9.0
+    assert metrics["resize/timing_s/hard_switch_total"] == 21.5
+
+
 def test_gpu_direct_model_stage_uses_active_and_target_actor_ranks():
     class _PhysicalWorkerGroup:
         def stage_actor_model_for_resize(self, old_ranks, new_ranks, transfer_optimizer, global_step):

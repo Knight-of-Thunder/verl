@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from contextlib import nullcontext
 from pprint import pprint
@@ -293,6 +294,33 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/handoff_rng_transfer_derived_ranks": 0.0,
             "resize/handoff_rng_transfer_fallback_reason": "",
         }
+
+    @staticmethod
+    def _dynamic_resize_timing_metrics(timing_raw: dict[str, float], hard_switch_total_s: float) -> dict[str, float]:
+        timing_names = {
+            "dynamic_resize_save_checkpoint": "save_checkpoint",
+            "dynamic_resize_destroy_runtime": "destroy_runtime",
+            "dynamic_resize_stage_model_gpu": "stage_training_state_gpu",
+            "dynamic_resize_rebuild_topology": "rebuild_topology",
+            "dynamic_resize_rebuild_training_runtime": "rebuild_training_runtime",
+            "dynamic_resize_training_shutdown": "training_shutdown",
+            "dynamic_resize_training_process_groups": "training_process_groups",
+            "dynamic_resize_actor_ref_reinit": "actor_ref_reinit",
+            "dynamic_resize_critic_reinit": "critic_reinit",
+            "dynamic_resize_ref_reinit": "ref_reinit",
+            "dynamic_resize_rebuild_rollout_runtime": "rebuild_rollout_runtime",
+            "dynamic_resize_rebuild_agent_loop": "rebuild_agent_loop",
+            "dynamic_resize_rebuild_checkpoint_engine": "rebuild_checkpoint_engine",
+            "dynamic_resize_restore_training_state": "restore_training_state",
+            "dynamic_resize_rebuild_runtime": "rebuild_runtime_total",
+            "dynamic_resize_update_weights": "update_rollout_weights",
+        }
+        metrics = {
+            f"resize/timing_s/{metric_name}": float(timing_raw.get(raw_name, 0.0))
+            for raw_name, metric_name in timing_names.items()
+        }
+        metrics["resize/timing_s/hard_switch_total"] = float(hard_switch_total_s)
+        return metrics
 
     def _build_resize_control_metrics(self, snapshot: dict[str, float | str | int]) -> dict[str, float | str | int]:
         metrics = self._default_resize_control_metrics()
@@ -1079,38 +1107,42 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             raise ValueError(f"actor_size must be in [1, {physical_world_size}], got {actor_size}")
 
         actor_ranks = list(range(actor_size))
-        physical_actor_wg.shutdown_actor_runtime()
-        physical_actor_wg.destroy_actor_process_group()
-
         physical_critic_wg = getattr(self, "_physical_critic_wg", None)
-        if physical_critic_wg is not None:
-            physical_critic_wg.shutdown_runtime()
-            physical_critic_wg.destroy_process_group()
-
         physical_ref_wg = getattr(self, "_physical_ref_policy_wg", None)
-        if physical_ref_wg is not None:
-            physical_ref_wg.shutdown_runtime()
-            physical_ref_wg.destroy_process_group()
+
+        with marked_timer("dynamic_resize_training_shutdown", self.timing_raw, color="green"):
+            physical_actor_wg.shutdown_actor_runtime()
+            physical_actor_wg.destroy_actor_process_group()
+            if physical_critic_wg is not None:
+                physical_critic_wg.shutdown_runtime()
+                physical_critic_wg.destroy_process_group()
+            if physical_ref_wg is not None:
+                physical_ref_wg.shutdown_runtime()
+                physical_ref_wg.destroy_process_group()
 
         # Every physical rank must create groups in the same order, including
         # ranks which become rollout-only after this transition.
-        physical_actor_wg.prepare_actor_process_group(actor_ranks)
+        with marked_timer("dynamic_resize_training_process_groups", self.timing_raw, color="green"):
+            physical_actor_wg.prepare_actor_process_group(actor_ranks)
+            if physical_critic_wg is not None:
+                physical_critic_wg.prepare_process_group(actor_ranks)
+            if physical_ref_wg is not None:
+                physical_ref_wg.prepare_process_group(actor_ranks)
+
+        with marked_timer("dynamic_resize_actor_ref_reinit", self.timing_raw, color="green"):
+            self.actor_wg = physical_actor_wg.subgroup(actor_ranks, name_prefix="hybrid_actor")
+            self.actor_rollout_wg = self.actor_wg
+            self.actor_wg.reinitialize_actor_runtime()
+
         if physical_critic_wg is not None:
-            physical_critic_wg.prepare_process_group(actor_ranks)
-        if physical_ref_wg is not None:
-            physical_ref_wg.prepare_process_group(actor_ranks)
-
-        self.actor_wg = physical_actor_wg.subgroup(actor_ranks, name_prefix="hybrid_actor")
-        self.actor_rollout_wg = self.actor_wg
-        self.actor_wg.reinitialize_actor_runtime()
-
-        if physical_critic_wg is not None:
-            self.critic_wg = physical_critic_wg.subgroup(actor_ranks, name_prefix="hybrid_critic")
-            self.critic_wg.reinitialize_runtime()
+            with marked_timer("dynamic_resize_critic_reinit", self.timing_raw, color="green"):
+                self.critic_wg = physical_critic_wg.subgroup(actor_ranks, name_prefix="hybrid_critic")
+                self.critic_wg.reinitialize_runtime()
 
         if physical_ref_wg is not None:
-            self.ref_policy_wg = physical_ref_wg.subgroup(actor_ranks, name_prefix="hybrid_ref")
-            self.ref_policy_wg.reinitialize_runtime()
+            with marked_timer("dynamic_resize_ref_reinit", self.timing_raw, color="green"):
+                self.ref_policy_wg = physical_ref_wg.subgroup(actor_ranks, name_prefix="hybrid_ref")
+                self.ref_policy_wg.reinitialize_runtime()
         elif self.actor_role == Role.ActorRolloutRef:
             self.ref_policy_wg = self.actor_wg
 
@@ -1178,22 +1210,26 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         rollout_world_size = self._validate_hybrid_split(actor_size=actor_size, rollout_size=rollout_size)
         physical_worker_group = self._physical_actor_rollout_wg
 
-        self._rebuild_hybrid_training_runtime(actor_size=actor_size)
-        self._set_hybrid_rollout_subgroup(actor_size=actor_size)
-        physical_worker_group.reset_rollout_server_handle()
-        await self.llm_server_manager.rebuild_hybrid_runtime(
-            self._runtime_rollout_worker_group,
-            start_rank=actor_size // rollout_world_size,
-        )
-        self._init_agent_loop_manager()
-        self._refresh_dynamic_resize_checkpoint_group_name()
-        checkpoint_engine_config = self.config.actor_rollout_ref.rollout.checkpoint_engine
-        backend_kwargs = checkpoint_engine_config.engine_kwargs[checkpoint_engine_config.backend]
-        physical_worker_group.reconfigure_checkpoint_engine(
-            group_name=backend_kwargs.group_name,
-            rebuild_group=True,
-        )
-        self._build_dynamic_resize_checkpoint_manager()
+        with marked_timer("dynamic_resize_rebuild_training_runtime", self.timing_raw, color="green"):
+            self._rebuild_hybrid_training_runtime(actor_size=actor_size)
+        with marked_timer("dynamic_resize_rebuild_rollout_runtime", self.timing_raw, color="green"):
+            self._set_hybrid_rollout_subgroup(actor_size=actor_size)
+            physical_worker_group.reset_rollout_server_handle()
+            await self.llm_server_manager.rebuild_hybrid_runtime(
+                self._runtime_rollout_worker_group,
+                start_rank=actor_size // rollout_world_size,
+            )
+        with marked_timer("dynamic_resize_rebuild_agent_loop", self.timing_raw, color="green"):
+            self._init_agent_loop_manager()
+        with marked_timer("dynamic_resize_rebuild_checkpoint_engine", self.timing_raw, color="green"):
+            self._refresh_dynamic_resize_checkpoint_group_name()
+            checkpoint_engine_config = self.config.actor_rollout_ref.rollout.checkpoint_engine
+            backend_kwargs = checkpoint_engine_config.engine_kwargs[checkpoint_engine_config.backend]
+            physical_worker_group.reconfigure_checkpoint_engine(
+                group_name=backend_kwargs.group_name,
+                rebuild_group=True,
+            )
+            self._build_dynamic_resize_checkpoint_manager()
         self._active_dynamic_resize_topology = {
             "actor_size": actor_size,
             "rollout_size": rollout_size,
@@ -1230,6 +1266,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             metrics.update({"resize/unsupported_reason": reason, "resize/pending_resource_switch": 1.0})
             return metrics
 
+        hard_switch_started_at = time.perf_counter()
         checkpoint_step_folder = self._dynamic_resize_checkpoint_step_folder()
         with marked_timer("dynamic_resize_save_checkpoint", self.timing_raw, color="green"):
             self._save_checkpoint(save_full_model_for_dynamic_resize=True)
@@ -1241,7 +1278,8 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             )
             metrics.update(optimizer_stage_metrics)
 
-        await self._destroy_dynamic_resize_runtime()
+        with marked_timer("dynamic_resize_destroy_runtime", self.timing_raw, color="green"):
+            await self._destroy_dynamic_resize_runtime()
         direct_model_staged = False
         if self._gpu_direct_actor_model_resize_enabled():
             try:
@@ -1271,6 +1309,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 )
 
         with marked_timer("dynamic_resize_rebuild_runtime", self.timing_raw, color="green"):
+            rebuild_topology_started_at = time.perf_counter()
             if self.hybrid_engine:
                 await self._rebuild_hybrid_dynamic_resize_runtime(
                     actor_size=actor_target,
@@ -1278,7 +1317,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 )
             else:
                 self._rebuild_dynamic_resize_runtime(actor_size=actor_target, rollout_size=rollout_target)
+            self.timing_raw["dynamic_resize_rebuild_topology"] = time.perf_counter() - rebuild_topology_started_at
 
+            restore_training_state_started_at = time.perf_counter()
             direct_model_restored = False
             if direct_model_staged:
                 try:
@@ -1333,6 +1374,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             )
             if optimizer_stage_metrics.get("resize/handoff_error") and not metrics.get("resize/handoff_error"):
                 metrics["resize/handoff_error"] = optimizer_stage_metrics["resize/handoff_error"]
+            self.timing_raw["dynamic_resize_restore_training_state"] = (
+                time.perf_counter() - restore_training_state_started_at
+            )
 
         with marked_timer("dynamic_resize_update_weights", self.timing_raw, color="green"):
             await self.checkpoint_manager.update_weights(self.global_steps)
@@ -1348,6 +1392,12 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 "resize/target_rollout_size": float(rollout_target),
                 "resize/unsupported_reason": "",
             }
+        )
+        metrics.update(
+            self._dynamic_resize_timing_metrics(
+                self.timing_raw,
+                hard_switch_total_s=time.perf_counter() - hard_switch_started_at,
+            )
         )
         if self._resize_controller is not None:
             snapshot = self._resize_controller.mark_resize_applied(step=self.global_steps, action=required_action)
