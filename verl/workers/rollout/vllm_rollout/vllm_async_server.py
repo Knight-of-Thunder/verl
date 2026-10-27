@@ -806,6 +806,19 @@ class vLLMHttpServer:
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
 
+    async def park(self):
+        """Discard weights and KV cache while keeping EngineCore alive."""
+        if self.node_rank != 0:
+            return
+        if self.rollout_mode != RolloutMode.HYBRID:
+            raise RuntimeError(f"park is only supported in hybrid mode, got {self.rollout_mode}")
+        if not self.config.enable_sleep_mode:
+            raise RuntimeError("vLLM standby replicas require enable_sleep_mode=True")
+
+        await self.engine.sleep(level=2)
+        if _VLLM_VERSION >= version.parse("0.17.0"):
+            await self.engine.reset_encoder_cache()
+
     async def clear_kv_cache(self):
         if self.node_rank == 0:
             # reset_connector=True drops any attached external KV store
@@ -1244,6 +1257,11 @@ class vLLMReplica(RolloutReplica):
         # Drain DP engines for safe sleep.
         await self.servers[0].wait_for_requests_to_drain.remote()
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
+
+    async def park(self):
+        """Keep server/EngineCore processes but discard model and KV memory."""
+        await self.servers[0].wait_for_requests_to_drain.remote()
+        await asyncio.gather(*[server.park.remote() for server in self.servers])
 
     async def abort_all_requests(self) -> dict[str, Any]:
         """Abort all ongoing generation requests across all servers.

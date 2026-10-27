@@ -385,6 +385,8 @@ class LLMServerManager:
         self.worker_group = worker_group
         self.rollout_resource_pool = rollout_resource_pool
         self.start_rank = start_rank
+        self._standby_replicas: dict[int, RolloutReplica] = {}
+        self._pending_activation_replicas: list[RolloutReplica] = []
 
         assert worker_group is not None or self.rollout_config.nnodes > 0, "nnodes must be > 0 in standalone mode"
 
@@ -496,6 +498,75 @@ class LLMServerManager:
             full_determinism=getattr(self.rollout_config, "full_determinism", False),
         )
 
+    @staticmethod
+    def _worker_identity(worker: Any) -> str:
+        actor_id = getattr(worker, "_actor_id", None)
+        if actor_id is not None:
+            hex_method = getattr(actor_id, "hex", None)
+            return hex_method() if callable(hex_method) else str(actor_id)
+        return str(worker)
+
+    @classmethod
+    def _same_workers(cls, replica: RolloutReplica, workers: list[Any]) -> bool:
+        return [cls._worker_identity(worker) for worker in replica.workers] == [
+            cls._worker_identity(worker) for worker in workers
+        ]
+
+    def _rollout_world_size(self) -> int:
+        return (
+            self.rollout_config.tensor_model_parallel_size
+            * self.rollout_config.data_parallel_size
+            * self.rollout_config.pipeline_model_parallel_size
+        )
+
+    def _refresh_active_replica_handles(self) -> None:
+        self.server_handles = [replica._server_handle for replica in self.rollout_replicas]
+        self.server_addresses = [replica._server_address for replica in self.rollout_replicas]
+
+    async def _launch_hybrid_replica(
+        self,
+        *,
+        worker_group: RayWorkerGroup,
+        replica_rank: int,
+        worker_group_rank: int,
+    ) -> RolloutReplica:
+        replica = self.rollout_replica_class(
+            replica_rank=replica_rank,
+            config=self.rollout_config,
+            model_config=self.model_config,
+            gpus_per_node=self.rollout_config.n_gpus_per_node,
+        )
+        replica.worker_group_rank = worker_group_rank
+        await replica.init_hybrid(worker_group)
+        return replica
+
+    @auto_await
+    async def prepare_hybrid_runtime_resize(self, worker_group: RayWorkerGroup, start_rank: int = 0) -> None:
+        """Park replicas whose GPUs are about to return to training."""
+        if self.worker_group is None or self.rollout_config.name != "vllm":
+            return
+
+        rollout_world_size = self._rollout_world_size()
+        if worker_group.world_size % rollout_world_size != 0:
+            raise ValueError(
+                f"rollout worker group size {worker_group.world_size} must be divisible by "
+                f"replica world size {rollout_world_size}"
+            )
+        desired_ranks = {start_rank + local_rank for local_rank in range(worker_group.world_size // rollout_world_size)}
+        removed = [replica for replica in self.rollout_replicas if replica.replica_rank not in desired_ranks]
+        if not removed:
+            return
+
+        await asyncio.gather(*[replica.park() for replica in removed])
+        await self.global_load_balancer.remove_servers.remote([replica._server_address for replica in removed])
+        for replica in removed:
+            self._standby_replicas[replica.replica_rank] = replica
+        removed_ranks = {replica.replica_rank for replica in removed}
+        self.rollout_replicas = [
+            replica for replica in self.rollout_replicas if replica.replica_rank not in removed_ranks
+        ]
+        self._refresh_active_replica_handles()
+
     def get_client(self, client_cls=LLMServerClient, **kwargs) -> LLMServerClient:
         """Get the LLMServerClient to request LLM server replicas.
 
@@ -530,25 +601,106 @@ class LLMServerManager:
 
     @auto_await
     async def rebuild_hybrid_runtime(self, worker_group: RayWorkerGroup, start_rank: int = 0):
-        """Rebuild rollout server topology while retaining hybrid workers.
-
-        Existing server actors and the load balancer are replaced because
-        their TP/DP/PP communicators are topology-bound. The supplied group is
-        a logical view over persistent ``ActorRolloutRefWorker`` handles.
-        """
+        """Resize hybrid replicas while caching topology-compatible engines."""
         if self.worker_group is None:
             raise RuntimeError("rebuild_hybrid_runtime requires a hybrid worker group")
 
-        await asyncio.gather(*[replica.shutdown_runtime(kill_workers=False) for replica in self.rollout_replicas])
+        if self.rollout_config.name != "vllm":
+            await asyncio.gather(*[replica.shutdown_runtime(kill_workers=False) for replica in self.rollout_replicas])
+            load_balancer = getattr(self, "global_load_balancer", None)
+            if load_balancer is not None:
+                ray.kill(load_balancer, no_restart=True)
+            self.worker_group = worker_group
+            self.start_rank = start_rank
+            self.rollout_replicas = []
+            self.server_handles = []
+            self.server_addresses = []
+            await self._initialize_llm_servers()
+            await self._init_global_load_balancer()
+            return
 
-        load_balancer = getattr(self, "global_load_balancer", None)
-        if load_balancer is not None:
-            ray.kill(load_balancer, no_restart=True)
+        rollout_world_size = self._rollout_world_size()
+        if worker_group.world_size % rollout_world_size != 0:
+            raise ValueError(
+                f"rollout worker group size {worker_group.world_size} must be divisible by "
+                f"replica world size {rollout_world_size}"
+            )
+
+        old_active = {replica.replica_rank: replica for replica in self.rollout_replicas}
+        desired: list[tuple[int, int, list[Any]]] = []
+        for local_rank in range(worker_group.world_size // rollout_world_size):
+            replica_rank = start_rank + local_rank
+            begin = local_rank * rollout_world_size
+            workers = worker_group.workers[begin : begin + rollout_world_size]
+            desired.append((replica_rank, local_rank, workers))
+
+        desired_ranks = {replica_rank for replica_rank, _, _ in desired}
+        removed = [replica for rank, replica in old_active.items() if rank not in desired_ranks]
+        if removed:
+            await asyncio.gather(*[replica.park() for replica in removed])
+            await self.global_load_balancer.remove_servers.remote([replica._server_address for replica in removed])
+            for replica in removed:
+                self._standby_replicas[replica.replica_rank] = replica
+
+        next_active: list[RolloutReplica] = []
+        pending_activation: list[RolloutReplica] = []
+        reused: list[RolloutReplica] = []
+        launch_specs: list[tuple[int, int]] = []
+
+        for replica_rank, local_rank, workers in desired:
+            replica = old_active.get(replica_rank)
+            was_standby = False
+            if replica is None:
+                replica = self._standby_replicas.get(replica_rank)
+                was_standby = replica is not None
+
+            if replica is not None and self._same_workers(replica, workers):
+                replica.worker_group_rank = local_rank
+                replica.workers = workers
+                next_active.append(replica)
+                reused.append(replica)
+                if was_standby:
+                    self._standby_replicas.pop(replica_rank, None)
+                    pending_activation.append(replica)
+                continue
+
+            if replica is not None:
+                raise RuntimeError(f"replica {replica_rank} changed physical workers; incremental vLLM reuse is unsafe")
+            launch_specs.append((replica_rank, local_rank))
+
+        if launch_specs:
+            launched = await asyncio.gather(
+                *[
+                    self._launch_hybrid_replica(
+                        worker_group=worker_group,
+                        replica_rank=replica_rank,
+                        worker_group_rank=local_rank,
+                    )
+                    for replica_rank, local_rank in launch_specs
+                ]
+            )
+            pending_activation.extend(launched)
+            next_active.extend(launched)
+            next_active.sort(key=lambda replica: replica.replica_rank)
+
+        # Existing replicas may have entered level-2 sleep before the topology
+        # transition. Recreate their empty weight/KV mappings; the subsequent
+        # checkpoint-engine update overwrites every weight before generation.
+        if reused:
+            await asyncio.gather(*[replica.wake_up() for replica in reused])
 
         self.worker_group = worker_group
         self.start_rank = start_rank
-        self.rollout_replicas = []
-        self.server_handles = []
-        self.server_addresses = []
-        await self._initialize_llm_servers()
-        await self._init_global_load_balancer()
+        self.rollout_replicas = next_active
+        self._pending_activation_replicas = pending_activation
+        self._refresh_active_replica_handles()
+        print(f"LLMServerManager: {self.server_addresses}")
+
+    @auto_await
+    async def activate_pending_hybrid_replicas(self) -> None:
+        """Publish restored/new replicas only after their weight sync succeeds."""
+        if not self._pending_activation_replicas:
+            return
+        servers = {replica._server_address: replica._server_handle for replica in self._pending_activation_replicas}
+        await self.global_load_balancer.add_servers.remote(servers)
+        self._pending_activation_replicas = []

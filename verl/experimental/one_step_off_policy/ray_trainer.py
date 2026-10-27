@@ -1210,10 +1210,15 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         rollout_world_size = self._validate_hybrid_split(actor_size=actor_size, rollout_size=rollout_size)
         physical_worker_group = self._physical_actor_rollout_wg
 
+        self._set_hybrid_rollout_subgroup(actor_size=actor_size)
+        await self.llm_server_manager.prepare_hybrid_runtime_resize(
+            self._runtime_rollout_worker_group,
+            start_rank=actor_size // rollout_world_size,
+        )
+
         with marked_timer("dynamic_resize_rebuild_training_runtime", self.timing_raw, color="green"):
             self._rebuild_hybrid_training_runtime(actor_size=actor_size)
         with marked_timer("dynamic_resize_rebuild_rollout_runtime", self.timing_raw, color="green"):
-            self._set_hybrid_rollout_subgroup(actor_size=actor_size)
             physical_worker_group.reset_rollout_server_handle()
             await self.llm_server_manager.rebuild_hybrid_runtime(
                 self._runtime_rollout_worker_group,
@@ -1280,6 +1285,16 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
 
         with marked_timer("dynamic_resize_destroy_runtime", self.timing_raw, color="green"):
             await self._destroy_dynamic_resize_runtime()
+            if self.hybrid_engine:
+                rollout_world_size = self._validate_hybrid_split(
+                    actor_size=actor_target,
+                    rollout_size=rollout_target,
+                )
+                self._set_hybrid_rollout_subgroup(actor_size=actor_target)
+                await self.llm_server_manager.prepare_hybrid_runtime_resize(
+                    self._runtime_rollout_worker_group,
+                    start_rank=actor_target // rollout_world_size,
+                )
         direct_model_staged = False
         if self._gpu_direct_actor_model_resize_enabled():
             try:
@@ -1380,6 +1395,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
 
         with marked_timer("dynamic_resize_update_weights", self.timing_raw, color="green"):
             await self.checkpoint_manager.update_weights(self.global_steps)
+            await self.llm_server_manager.activate_pending_hybrid_replicas()
 
         metrics.update(
             {

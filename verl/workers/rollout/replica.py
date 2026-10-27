@@ -275,6 +275,15 @@ class RolloutReplica(ABC):
         """Sleep each rollout server."""
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
 
+    async def park(self):
+        """Release runtime memory while retaining the server processes.
+
+        Backends may override this with a stronger release policy than the
+        regular train/rollout sleep transition. The default keeps the existing
+        sleep behavior for compatibility.
+        """
+        await self.sleep()
+
     async def abort_all_requests(self):
         """Partial rollout: abort and save all unfinished requests in each rollout server."""
         await asyncio.gather(*[server.abort_all_requests.remote() for server in self.servers])
