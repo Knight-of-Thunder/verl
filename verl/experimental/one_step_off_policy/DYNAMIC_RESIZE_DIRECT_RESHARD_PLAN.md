@@ -960,6 +960,32 @@ plans, and raw optimizer snapshot round trips. They do not validate:
 
 Those gaps map directly to Phases 1 through 6 above.
 
+### 17.15 Optimizer prototype memory and rollback boundary
+
+The first GPU-direct optimizer implementation intentionally proves numerical
+continuation before solving production-scale memory pressure. It stages the
+complete target-local Adam state on GPU while the old optimizer is still
+alive. For AdamW this includes at least `exp_avg` and `exp_avg_sq`, so peak
+memory can include the old model and optimizer plus staged target model and
+optimizer shards.
+
+This prototype is not yet suitable for large models close to device capacity.
+Production hardening must add:
+
+- bucketed transfer with an explicit peak-memory budget;
+- early release or reusable storage for source buckets without violating the
+  rollback contract;
+- destination acknowledgements and per-bucket checksums;
+- a prepare/commit protocol that keeps the old topology recoverable until all
+  target state has been validated;
+- timeout, communicator abort, and deterministic disk fallback behavior;
+- fault-injection tests covering OOM and failures between model and optimizer
+  restore.
+
+Until those items are implemented, GPU-direct optimizer migration remains an
+opt-in single-node prototype with the existing disk checkpoint as the final
+fallback.
+
 ## 18. Source Evidence Index
 
 The principal implementation anchors in this checkout are:

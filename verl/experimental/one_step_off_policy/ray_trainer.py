@@ -278,6 +278,11 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/handoff_model_transfer_tensor_count": 0.0,
             "resize/handoff_model_transfer_bytes": 0.0,
             "resize/handoff_model_transfer_fallback_reason": "",
+            "resize/handoff_optimizer_transfer_status": "disabled",
+            "resize/handoff_optimizer_transfer_success": 0.0,
+            "resize/handoff_optimizer_transfer_tensor_count": 0.0,
+            "resize/handoff_optimizer_transfer_bytes": 0.0,
+            "resize/handoff_optimizer_transfer_fallback_reason": "",
         }
 
     def _build_resize_control_metrics(self, snapshot: dict[str, float | str | int]) -> dict[str, float | str | int]:
@@ -861,7 +866,12 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
 
         old_ranks = list(range(actor_source))
         new_ranks = list(range(actor_target))
-        results = self._physical_actor_rollout_wg.stage_actor_model_for_resize(old_ranks, new_ranks)
+        transfer_optimizer = bool(self._host_staging_config.stage_optimizer)
+        results = self._physical_actor_rollout_wg.stage_actor_model_for_resize(
+            old_ranks,
+            new_ranks,
+            transfer_optimizer,
+        )
         target_results = [result for result in results if result.get("status") == "staged"]
         if len(target_results) != actor_target:
             raise RuntimeError(
@@ -871,6 +881,14 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         if len(tensor_counts) != 1:
             raise RuntimeError(f"GPU-direct model resize returned inconsistent tensor counts: {tensor_counts}")
         total_bytes = sum(int(result.get("staged_bytes", 0)) for result in target_results)
+        optimizer_tensor_counts = {int(result.get("optimizer_tensor_count", 0)) for result in target_results}
+        if len(optimizer_tensor_counts) != 1:
+            raise RuntimeError(
+                f"GPU-direct optimizer resize returned inconsistent tensor counts: {optimizer_tensor_counts}"
+            )
+        if transfer_optimizer and any(result.get("optimizer_status") != "staged" for result in target_results):
+            raise RuntimeError("GPU-direct optimizer resize did not stage every target rank")
+        optimizer_total_bytes = sum(int(result.get("optimizer_staged_bytes", 0)) for result in target_results)
         logger.info(
             "[one-step-off][resize] staged actor model directly on %s ranks: tensors=%s bytes=%s",
             actor_target,
@@ -883,6 +901,11 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/handoff_model_transfer_tensor_count": float(next(iter(tensor_counts))),
             "resize/handoff_model_transfer_bytes": float(total_bytes),
             "resize/handoff_model_transfer_fallback_reason": "",
+            "resize/handoff_optimizer_transfer_status": "staged" if transfer_optimizer else "disabled",
+            "resize/handoff_optimizer_transfer_success": 0.0,
+            "resize/handoff_optimizer_transfer_tensor_count": float(next(iter(optimizer_tensor_counts))),
+            "resize/handoff_optimizer_transfer_bytes": float(optimizer_total_bytes),
+            "resize/handoff_optimizer_transfer_fallback_reason": "",
         }
 
     def _restore_gpu_direct_actor_model(self) -> dict[str, float | str | int]:
@@ -893,6 +916,11 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 f"GPU-direct model resize restored {len(restored)} ranks, expected {self.actor_wg.world_size}"
             )
         total_bytes = sum(int(result.get("restored_bytes", 0)) for result in restored)
+        optimizer_tensor_count = max(int(result.get("optimizer_tensor_count", 0)) for result in restored)
+        optimizer_total_bytes = sum(int(result.get("optimizer_restored_bytes", 0)) for result in restored)
+        optimizer_restored = all(result.get("optimizer_status") == "restored" for result in restored)
+        if self._host_staging_config.stage_optimizer and not optimizer_restored:
+            raise RuntimeError("GPU-direct optimizer resize did not restore every target rank")
         logger.info(
             "[one-step-off][resize] restored actor model directly on %s ranks: tensors=%s bytes=%s",
             self.actor_wg.world_size,
@@ -907,6 +935,11 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             ),
             "resize/handoff_model_transfer_bytes": float(total_bytes),
             "resize/handoff_model_transfer_fallback_reason": "",
+            "resize/handoff_optimizer_transfer_status": "restored" if optimizer_restored else "disabled",
+            "resize/handoff_optimizer_transfer_success": 1.0 if optimizer_restored else 0.0,
+            "resize/handoff_optimizer_transfer_tensor_count": float(optimizer_tensor_count),
+            "resize/handoff_optimizer_transfer_bytes": float(optimizer_total_bytes),
+            "resize/handoff_optimizer_transfer_fallback_reason": "",
         }
 
     def _clear_gpu_direct_actor_model(self) -> None:
@@ -1149,7 +1182,11 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         with marked_timer("dynamic_resize_save_checkpoint", self.timing_raw, color="green"):
             self._save_checkpoint(save_full_model_for_dynamic_resize=True)
             metrics.update(self._prepare_dynamic_resize_handoff_session(checkpoint_step_folder))
-            optimizer_stage_metrics = self._stage_dynamic_resize_optimizer_handoff(checkpoint_step_folder)
+            optimizer_stage_metrics = (
+                {}
+                if self._gpu_direct_actor_model_resize_enabled()
+                else self._stage_dynamic_resize_optimizer_handoff(checkpoint_step_folder)
+            )
             metrics.update(optimizer_stage_metrics)
 
         await self._destroy_dynamic_resize_runtime()
@@ -1169,6 +1206,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                         "resize/handoff_model_transfer_status": "fallback",
                         "resize/handoff_model_transfer_success": 0.0,
                         "resize/handoff_model_transfer_fallback_reason": str(exc),
+                        "resize/handoff_optimizer_transfer_status": "fallback",
+                        "resize/handoff_optimizer_transfer_success": 0.0,
+                        "resize/handoff_optimizer_transfer_fallback_reason": str(exc),
                     }
                 )
 
@@ -1196,6 +1236,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                             "resize/handoff_model_transfer_status": "fallback",
                             "resize/handoff_model_transfer_success": 0.0,
                             "resize/handoff_model_transfer_fallback_reason": str(exc),
+                            "resize/handoff_optimizer_transfer_status": "fallback",
+                            "resize/handoff_optimizer_transfer_success": 0.0,
+                            "resize/handoff_optimizer_transfer_fallback_reason": str(exc),
                         }
                     )
 
@@ -1204,7 +1247,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 load_actor=not direct_model_restored,
             )
             model_transfer_metrics = {
-                key: value for key, value in metrics.items() if key.startswith("resize/handoff_model_transfer_")
+                key: value
+                for key, value in metrics.items()
+                if key.startswith(("resize/handoff_model_transfer_", "resize/handoff_optimizer_transfer_"))
             }
             metrics.update(self._complete_dynamic_resize_handoff_session(checkpoint_step_folder))
             metrics.update(model_transfer_metrics)

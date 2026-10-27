@@ -100,26 +100,46 @@ def test_one_step_off_configs_define_disabled_dynamic_resize_by_default():
     assert fsdp_cfg.trainer.dynamic_resize.schedule == []
 
 
-def test_dynamic_resize_recipe_enables_phase_one_gpu_direct_model_handoff():
+def test_dynamic_resize_recipe_enables_gpu_direct_model_and_optimizer_handoff():
     cfg = OmegaConf.load("verl/experimental/one_step_off_policy/config/one_step_off_ppo_trainer_dynamic_resize.yaml")
 
     assert cfg.trainer.dynamic_resize.handoff.backend == "gpu_direct"
-    assert cfg.trainer.dynamic_resize.handoff.stage_optimizer is False
+    assert cfg.trainer.dynamic_resize.handoff.stage_optimizer is True
     assert cfg.trainer.dynamic_resize.handoff.optimizer_full_state_restore is False
 
 
 def test_gpu_direct_model_stage_uses_active_and_target_actor_ranks():
     class _PhysicalWorkerGroup:
-        def stage_actor_model_for_resize(self, old_ranks, new_ranks):
+        def stage_actor_model_for_resize(self, old_ranks, new_ranks, transfer_optimizer):
             assert old_ranks == [0, 1, 2, 3]
             assert new_ranks == [0, 1, 2, 3, 4, 5]
-            return [{"status": "staged", "tensor_count": 7, "staged_bytes": 10} for _ in range(6)] + [
-                {"status": "non_member", "tensor_count": 0, "staged_bytes": 0} for _ in range(2)
+            assert transfer_optimizer is True
+            return [
+                {
+                    "status": "staged",
+                    "tensor_count": 7,
+                    "staged_bytes": 10,
+                    "optimizer_status": "staged",
+                    "optimizer_tensor_count": 15,
+                    "optimizer_staged_bytes": 20,
+                }
+                for _ in range(6)
+            ] + [
+                {
+                    "status": "non_member",
+                    "tensor_count": 0,
+                    "staged_bytes": 0,
+                    "optimizer_status": "non_member",
+                    "optimizer_tensor_count": 0,
+                    "optimizer_staged_bytes": 0,
+                }
+                for _ in range(2)
             ]
 
     trainer = object.__new__(OneStepOffRayTrainer)
     trainer._active_dynamic_resize_topology = {"actor_size": 4, "rollout_size": 4}
     trainer._physical_actor_rollout_wg = _PhysicalWorkerGroup()
+    trainer._host_staging_config = HostStagingConfig.from_dict({"stage_optimizer": True})
 
     metrics = trainer._stage_gpu_direct_actor_model(actor_target=6)
 
@@ -127,22 +147,57 @@ def test_gpu_direct_model_stage_uses_active_and_target_actor_ranks():
     assert metrics["resize/handoff_model_transfer_success"] == 0.0
     assert metrics["resize/handoff_model_transfer_tensor_count"] == 7.0
     assert metrics["resize/handoff_model_transfer_bytes"] == 60.0
+    assert metrics["resize/handoff_optimizer_transfer_status"] == "staged"
+    assert metrics["resize/handoff_optimizer_transfer_tensor_count"] == 15.0
+    assert metrics["resize/handoff_optimizer_transfer_bytes"] == 120.0
 
 
 def test_gpu_direct_model_stage_accepts_source_only_ranks_during_actor_scale_down():
     class _PhysicalWorkerGroup:
-        def stage_actor_model_for_resize(self, old_ranks, new_ranks):
+        def stage_actor_model_for_resize(self, old_ranks, new_ranks, transfer_optimizer):
             assert old_ranks == [0, 1, 2, 3, 4, 5]
             assert new_ranks == [0, 1, 2, 3]
+            assert transfer_optimizer is True
             return (
-                [{"status": "staged", "tensor_count": 7, "staged_bytes": 15} for _ in range(4)]
-                + [{"status": "source_only", "tensor_count": 7, "staged_bytes": 0} for _ in range(2)]
-                + [{"status": "non_member", "tensor_count": 0, "staged_bytes": 0} for _ in range(2)]
+                [
+                    {
+                        "status": "staged",
+                        "tensor_count": 7,
+                        "staged_bytes": 15,
+                        "optimizer_status": "staged",
+                        "optimizer_tensor_count": 15,
+                        "optimizer_staged_bytes": 25,
+                    }
+                    for _ in range(4)
+                ]
+                + [
+                    {
+                        "status": "source_only",
+                        "tensor_count": 7,
+                        "staged_bytes": 0,
+                        "optimizer_status": "source_only",
+                        "optimizer_tensor_count": 15,
+                        "optimizer_staged_bytes": 0,
+                    }
+                    for _ in range(2)
+                ]
+                + [
+                    {
+                        "status": "non_member",
+                        "tensor_count": 0,
+                        "staged_bytes": 0,
+                        "optimizer_status": "non_member",
+                        "optimizer_tensor_count": 0,
+                        "optimizer_staged_bytes": 0,
+                    }
+                    for _ in range(2)
+                ]
             )
 
     trainer = object.__new__(OneStepOffRayTrainer)
     trainer._active_dynamic_resize_topology = {"actor_size": 6, "rollout_size": 2}
     trainer._physical_actor_rollout_wg = _PhysicalWorkerGroup()
+    trainer._host_staging_config = HostStagingConfig.from_dict({"stage_optimizer": True})
 
     metrics = trainer._stage_gpu_direct_actor_model(actor_target=4)
 
@@ -150,6 +205,38 @@ def test_gpu_direct_model_stage_accepts_source_only_ranks_during_actor_scale_dow
     assert metrics["resize/handoff_model_transfer_success"] == 0.0
     assert metrics["resize/handoff_model_transfer_tensor_count"] == 7.0
     assert metrics["resize/handoff_model_transfer_bytes"] == 60.0
+    assert metrics["resize/handoff_optimizer_transfer_tensor_count"] == 15.0
+    assert metrics["resize/handoff_optimizer_transfer_bytes"] == 100.0
+
+
+def test_gpu_direct_restore_requires_optimizer_on_every_target_rank():
+    class _ActorWorkerGroup:
+        world_size = 2
+
+        def restore_actor_model_after_resize(self):
+            return [
+                {
+                    "status": "restored",
+                    "tensor_count": 7,
+                    "restored_bytes": 10,
+                    "optimizer_status": "restored",
+                    "optimizer_tensor_count": 15,
+                    "optimizer_restored_bytes": 20,
+                }
+                for _ in range(2)
+            ]
+
+    trainer = object.__new__(OneStepOffRayTrainer)
+    trainer.actor_wg = _ActorWorkerGroup()
+    trainer._host_staging_config = HostStagingConfig.from_dict({"stage_optimizer": True})
+
+    metrics = trainer._restore_gpu_direct_actor_model()
+
+    assert metrics["resize/handoff_model_transfer_success"] == 1.0
+    assert metrics["resize/handoff_optimizer_transfer_status"] == "restored"
+    assert metrics["resize/handoff_optimizer_transfer_success"] == 1.0
+    assert metrics["resize/handoff_optimizer_transfer_tensor_count"] == 15.0
+    assert metrics["resize/handoff_optimizer_transfer_bytes"] == 40.0
 
 
 def test_dynamic_resize_checkpoint_load_can_skip_actor_for_gpu_direct_restore():

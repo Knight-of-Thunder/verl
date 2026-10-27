@@ -55,11 +55,11 @@ trainer:
       enable: true
     handoff:
       enable: true
-      # Direct path: FSDP2, one-dimensional full shard, actor expansion or scale-down.
+      # Direct path: FSDP2, one-dimensional full shard, actor model and AdamW state.
       # A full checkpoint is still written before commit and used on failure.
       backend: gpu_direct
       chunk_mb: 256
-      stage_optimizer: false
+      stage_optimizer: true
       optimizer_restore_policy: deferred
       progressive_swap: true
       async_optimizer_preload: true

@@ -39,7 +39,12 @@ from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.device import get_device_id, get_device_name
-from verl.utils.fsdp_resize import restore_fsdp2_model_state, stage_fsdp2_model_state
+from verl.utils.fsdp_resize import (
+    restore_fsdp2_model_state,
+    restore_fsdp2_optimizer_state,
+    stage_fsdp2_model_state,
+    stage_fsdp2_optimizer_state,
+)
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     FSDPModule,
@@ -118,6 +123,8 @@ class FSDPEngine(BaseEngine):
         self.rank = torch.distributed.get_rank()
         self.process_group = None
         self._resize_model_state: dict[str, torch.Tensor] | None = None
+        self._resize_optimizer_state: dict | None = None
+        self._resize_optimizer_required = False
 
         # Apply NPU patches for FSDP backend
         from .utils import apply_npu_fsdp_patches
@@ -203,8 +210,13 @@ class FSDPEngine(BaseEngine):
         gc.collect()
         aggressive_empty_cache(force_sync=True)
 
-    def stage_model_for_resize(self, old_ranks: list[int], new_ranks: list[int]) -> dict[str, int | str]:
-        """Stage this rank's target FSDP2 shard through a temporary NCCL group."""
+    def stage_model_for_resize(
+        self,
+        old_ranks: list[int],
+        new_ranks: list[int],
+        transfer_optimizer: bool = False,
+    ) -> dict[str, int | str]:
+        """Stage this rank's target FSDP2 model and optimizer shards."""
         import socket
 
         if device_name != "cuda":
@@ -238,7 +250,16 @@ class FSDPEngine(BaseEngine):
         try:
             if global_rank not in transfer_ranks:
                 self._resize_model_state = None
-                result = {"status": "non_member", "tensor_count": 0, "staged_bytes": 0}
+                self._resize_optimizer_state = None
+                self._resize_optimizer_required = transfer_optimizer
+                result = {
+                    "status": "non_member",
+                    "tensor_count": 0,
+                    "staged_bytes": 0,
+                    "optimizer_status": "non_member" if transfer_optimizer else "disabled",
+                    "optimizer_tensor_count": 0,
+                    "optimizer_staged_bytes": 0,
+                }
             else:
                 model = self.module if global_rank in old_ranks else None
                 staged_state, stats = stage_fsdp2_model_state(
@@ -248,8 +269,30 @@ class FSDPEngine(BaseEngine):
                     transfer_group=transfer_group,
                     device=torch.device(device_name, get_device_id()),
                 )
+                optimizer_state = None
+                optimizer_stats = {"tensor_count": 0, "staged_bytes": 0}
+                if transfer_optimizer:
+                    optimizer = self.optimizer if global_rank in old_ranks else None
+                    optimizer_state, optimizer_stats = stage_fsdp2_optimizer_state(
+                        model,
+                        optimizer,
+                        old_ranks=old_ranks,
+                        new_ranks=new_ranks,
+                        transfer_group=transfer_group,
+                        device=torch.device(device_name, get_device_id()),
+                    )
                 self._resize_model_state = staged_state
-                result = {"status": "staged" if staged_state is not None else "source_only", **stats}
+                self._resize_optimizer_state = optimizer_state
+                self._resize_optimizer_required = transfer_optimizer
+                result = {
+                    "status": "staged" if staged_state is not None else "source_only",
+                    **stats,
+                    "optimizer_status": ("staged" if optimizer_state is not None else "source_only")
+                    if transfer_optimizer
+                    else "disabled",
+                    "optimizer_tensor_count": optimizer_stats["tensor_count"],
+                    "optimizer_staged_bytes": optimizer_stats["staged_bytes"],
+                }
             if global_rank in transfer_ranks:
                 torch.distributed.barrier(group=transfer_group)
         finally:
@@ -265,12 +308,32 @@ class FSDPEngine(BaseEngine):
         if self.module is None:
             raise RuntimeError("cannot restore GPU-direct model state before rebuilding the FSDP runtime")
         stats = restore_fsdp2_model_state(self.module, self._resize_model_state)
+        optimizer_required = self._resize_optimizer_required
+        optimizer_stats = {"tensor_count": 0, "restored_bytes": 0}
+        if optimizer_required:
+            if self.optimizer is None or self._resize_optimizer_state is None:
+                raise RuntimeError("no GPU-direct optimizer state is staged on this actor rank")
+            optimizer_stats = restore_fsdp2_optimizer_state(
+                self.module,
+                self.optimizer,
+                self._resize_optimizer_state,
+            )
         self._resize_model_state = None
+        self._resize_optimizer_state = None
+        self._resize_optimizer_required = False
         aggressive_empty_cache(force_sync=True)
-        return {"status": "restored", **stats}
+        return {
+            "status": "restored",
+            **stats,
+            "optimizer_status": "restored" if optimizer_required else "disabled",
+            "optimizer_tensor_count": optimizer_stats["tensor_count"],
+            "optimizer_restored_bytes": optimizer_stats["restored_bytes"],
+        }
 
     def clear_staged_model_resize_state(self) -> None:
         self._resize_model_state = None
+        self._resize_optimizer_state = None
+        self._resize_optimizer_required = False
         aggressive_empty_cache(force_sync=True)
 
     def is_mp_src_rank_with_outputs(self):

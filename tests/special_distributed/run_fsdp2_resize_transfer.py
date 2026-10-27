@@ -28,7 +28,12 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import fully_shard
 
-from verl.utils.fsdp_resize import restore_fsdp2_model_state, stage_fsdp2_model_state
+from verl.utils.fsdp_resize import (
+    restore_fsdp2_model_state,
+    restore_fsdp2_optimizer_state,
+    stage_fsdp2_model_state,
+    stage_fsdp2_optimizer_state,
+)
 
 
 def _build_model() -> nn.Module:
@@ -38,6 +43,38 @@ def _build_model() -> nn.Module:
         for index, parameter in enumerate(model.parameters()):
             parameter.copy_(torch.arange(parameter.numel()).reshape(parameter.shape) + index * 1000)
     return model.cuda()
+
+
+def _optimizer_step(model: nn.Module, optimizer: torch.optim.Optimizer, step_index: int) -> None:
+    optimizer.zero_grad(set_to_none=True)
+    for parameter_index, parameter in enumerate(model.parameters()):
+        parameter.grad = torch.full_like(parameter, 0.125 * (step_index + parameter_index + 1))
+    optimizer.step()
+
+
+def _assert_model_matches(actual_model: nn.Module, expected_model: nn.Module) -> None:
+    expected_state = expected_model.state_dict()
+    for name, value in actual_model.state_dict().items():
+        actual = value.full_tensor() if hasattr(value, "full_tensor") else value
+        torch.testing.assert_close(actual, expected_state[name])
+
+
+def _assert_optimizer_matches(
+    actual_model: nn.Module,
+    actual_optimizer: torch.optim.Optimizer,
+    expected_model: nn.Module,
+    expected_optimizer: torch.optim.Optimizer,
+) -> None:
+    expected_parameters = dict(expected_model.named_parameters())
+    for name, actual_parameter in actual_model.named_parameters():
+        actual_state = actual_optimizer.state[actual_parameter]
+        expected_state = expected_optimizer.state[expected_parameters[name]]
+        assert actual_state.keys() == expected_state.keys()
+        for state_name, actual_value in actual_state.items():
+            expected_value = expected_state[state_name]
+            if hasattr(actual_value, "full_tensor"):
+                actual_value = actual_value.full_tensor()
+            torch.testing.assert_close(actual_value, expected_value)
 
 
 def main() -> None:
@@ -53,6 +90,7 @@ def main() -> None:
 
     old_group = dist.new_group(ranks=old_ranks)
     old_model = None
+    old_optimizer = None
     if rank in old_ranks:
         old_mesh = DeviceMesh.from_group(
             old_group,
@@ -62,6 +100,8 @@ def main() -> None:
         )
         old_model = _build_model()
         fully_shard(old_model, mesh=old_mesh)
+        old_optimizer = torch.optim.AdamW(old_model.parameters(), lr=2e-3, weight_decay=0.03)
+        _optimizer_step(old_model, old_optimizer, step_index=0)
 
     staged_state, _ = stage_fsdp2_model_state(
         old_model,
@@ -71,8 +111,18 @@ def main() -> None:
         device=torch.device("cuda", local_rank),
     )
     assert (staged_state is not None) == (rank in new_ranks)
+    staged_optimizer_state, _ = stage_fsdp2_optimizer_state(
+        old_model,
+        old_optimizer,
+        old_ranks=old_ranks,
+        new_ranks=new_ranks,
+        transfer_group=dist.group.WORLD,
+        device=torch.device("cuda", local_rank),
+    )
+    assert (staged_optimizer_state is not None) == (rank in new_ranks)
 
     del old_model
+    del old_optimizer
     if rank in old_ranks:
         dist.destroy_process_group(old_group)
     torch.cuda.empty_cache()
@@ -91,19 +141,26 @@ def main() -> None:
             for parameter in new_model.parameters():
                 parameter.zero_()
         fully_shard(new_model, mesh=new_mesh)
+        new_optimizer = torch.optim.AdamW(new_model.parameters(), lr=9e-4, weight_decay=0.0)
         assert staged_state is not None
+        assert staged_optimizer_state is not None
         restore_fsdp2_model_state(new_model, staged_state)
+        restore_fsdp2_optimizer_state(new_model, new_optimizer, staged_optimizer_state)
 
         expected_model = _build_model()
-        expected_state = expected_model.state_dict()
-        actual_state = new_model.state_dict()
-        for name, value in actual_state.items():
-            actual = value.full_tensor() if hasattr(value, "full_tensor") else value
-            torch.testing.assert_close(actual, expected_state[name])
+        expected_optimizer = torch.optim.AdamW(expected_model.parameters(), lr=2e-3, weight_decay=0.03)
+        _optimizer_step(expected_model, expected_optimizer, step_index=0)
+        _assert_model_matches(new_model, expected_model)
+        _assert_optimizer_matches(new_model, new_optimizer, expected_model, expected_optimizer)
+
+        _optimizer_step(new_model, new_optimizer, step_index=1)
+        _optimizer_step(expected_model, expected_optimizer, step_index=1)
+        _assert_model_matches(new_model, expected_model)
+        _assert_optimizer_matches(new_model, new_optimizer, expected_model, expected_optimizer)
 
     dist.barrier()
     if rank == 0:
-        print(f"FSDP2 GPU-direct resize transfer {old_world_size}->{new_world_size} passed")
+        print(f"FSDP2 GPU-direct model and optimizer resize {old_world_size}->{new_world_size} passed")
     if rank in new_ranks:
         dist.destroy_process_group(new_group)
     dist.destroy_process_group()

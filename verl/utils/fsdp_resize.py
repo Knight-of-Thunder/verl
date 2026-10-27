@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from math import prod
 from typing import Any
@@ -148,6 +149,82 @@ def _build_manifest(model: torch.nn.Module) -> list[dict[str, Any]]:
     return manifest
 
 
+def _optimizer_param_groups(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> list[dict[str, Any]]:
+    name_by_parameter_id = {id(parameter): name for name, parameter in model.named_parameters()}
+    groups = []
+    for index, group in enumerate(optimizer.param_groups):
+        parameter_names = []
+        for parameter in group["params"]:
+            name = name_by_parameter_id.get(id(parameter))
+            if name is None:
+                raise RuntimeError(f"optimizer parameter group {index} contains a parameter absent from the model")
+            parameter_names.append(name)
+        options = {key: copy.deepcopy(value) for key, value in group.items() if key != "params"}
+        if any(isinstance(value, torch.Tensor) for value in options.values()):
+            raise NotImplementedError("GPU-direct optimizer resize does not support tensor-valued param-group options")
+        groups.append({"parameter_names": parameter_names, "options": options})
+    return groups
+
+
+def _build_optimizer_manifest(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> tuple[list[dict[str, Any]], dict[tuple[str, str], torch.Tensor]]:
+    name_by_parameter_id = {id(parameter): name for name, parameter in model.named_parameters()}
+    manifest = []
+    tensor_state: dict[tuple[str, str], torch.Tensor] = {}
+    for parameter, state in optimizer.state.items():
+        parameter_name = name_by_parameter_id.get(id(parameter))
+        if parameter_name is None:
+            raise RuntimeError("optimizer state contains a parameter absent from the model")
+        for state_name, value in state.items():
+            item: dict[str, Any] = {"parameter_name": parameter_name, "state_name": str(state_name)}
+            key = (parameter_name, str(state_name))
+            if isinstance(value, DTensor):
+                placements = value.placements
+                if len(placements) != 1 or not isinstance(placements[0], Shard) or placements[0].dim != 0:
+                    raise NotImplementedError(
+                        "GPU-direct optimizer resize only supports one-dimensional Shard(0) DTensor state, "
+                        f"got {placements} for {parameter_name}.{state_name}"
+                    )
+                item.update(
+                    {
+                        "kind": "sharded_tensor",
+                        "shape": tuple(int(v) for v in value.shape),
+                        "dtype": _dtype_name(value.dtype),
+                    }
+                )
+                tensor_state[key] = value
+            elif isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    raise NotImplementedError(
+                        "GPU-direct optimizer resize only supports DTensor shards and scalar plain tensors, "
+                        f"got shape {tuple(value.shape)} for {parameter_name}.{state_name}"
+                    )
+                item.update(
+                    {
+                        "kind": "scalar_tensor",
+                        "shape": tuple(int(v) for v in value.shape),
+                        "dtype": _dtype_name(value.dtype),
+                        "device_type": value.device.type,
+                        "value": value.item(),
+                    }
+                )
+            elif isinstance(value, bool | int | float | str) or value is None:
+                item.update({"kind": "value", "value": copy.deepcopy(value)})
+            else:
+                raise NotImplementedError(
+                    f"GPU-direct optimizer resize does not support state type {type(value)} "
+                    f"for {parameter_name}.{state_name}"
+                )
+            manifest.append(item)
+    manifest.sort(key=lambda item: (item["parameter_name"], item["state_name"]))
+    return manifest, tensor_state
+
+
 class FSDPResizeStateTransferManager:
     """Transfer FSDP2 local shards directly between differently sized meshes."""
 
@@ -223,11 +300,93 @@ class FSDPResizeStateTransferManager:
             "staged_bytes": staged_bytes,
         }
 
+    @torch.no_grad()
+    def stage_optimizer(
+        self,
+        model: torch.nn.Module | None,
+        optimizer: torch.optim.Optimizer | None,
+    ) -> tuple[dict[str, Any] | None, dict[str, int]]:
+        """Stage name-keyed optimizer shards for the target FSDP mesh."""
+        is_old_rank = self.global_rank in self.old_ranks
+        is_new_rank = self.global_rank in self.new_ranks
+        if is_old_rank and (model is None or optimizer is None):
+            raise RuntimeError(f"old actor rank {self.global_rank} has no active model optimizer")
+
+        source_state = None
+        local_manifest = None
+        local_param_groups = None
+        if is_old_rank:
+            assert model is not None and optimizer is not None
+            local_manifest, source_state = _build_optimizer_manifest(model, optimizer)
+            local_param_groups = _optimizer_param_groups(model, optimizer)
+
+        object_list = [
+            {"manifest": local_manifest, "param_groups": local_param_groups}
+            if self.global_rank == self.source_rank
+            else None
+        ]
+        dist.broadcast_object_list(
+            object_list,
+            src=self.source_rank,
+            group=self.transfer_group,
+            device=self.device,
+        )
+        envelope = object_list[0]
+        if not isinstance(envelope, dict):
+            raise RuntimeError("received an invalid FSDP optimizer resize manifest")
+        manifest = envelope.get("manifest")
+        param_groups = envelope.get("param_groups")
+        if not isinstance(manifest, list) or not isinstance(param_groups, list):
+            raise RuntimeError("received an invalid FSDP optimizer resize manifest")
+
+        target_state: dict[str, Any] | None = None
+        if is_new_rank:
+            target_state = {"manifest": manifest, "param_groups": param_groups, "state": {}}
+        staged_bytes = 0
+        sharded_tensor_count = 0
+        scalar_state_count = 0
+        for item in manifest:
+            parameter_name = str(item["parameter_name"])
+            state_name = str(item["state_name"])
+            key = (parameter_name, state_name)
+            kind = str(item["kind"])
+            if kind == "sharded_tensor":
+                local_value = self._transfer_sharded_tensor(
+                    f"{parameter_name}.{state_name}",
+                    item,
+                    source_state,
+                    source_key=key,
+                )
+                sharded_tensor_count += 1
+            elif kind in {"scalar_tensor", "value"}:
+                local_value = copy.deepcopy(item.get("value"))
+                scalar_state_count += 1
+            else:
+                raise RuntimeError(f"unsupported optimizer resize state kind: {kind}")
+
+            if is_new_rank:
+                assert target_state is not None
+                target_state["state"][key] = local_value
+                if isinstance(local_value, torch.Tensor):
+                    staged_bytes += local_value.numel() * local_value.element_size()
+                elif kind == "scalar_tensor":
+                    staged_bytes += torch.empty((), dtype=_resolve_dtype(str(item["dtype"]))).element_size()
+
+        get_torch_device().synchronize(self.device)
+        return target_state, {
+            "tensor_count": len(manifest),
+            "sharded_tensor_count": sharded_tensor_count,
+            "scalar_state_count": scalar_state_count,
+            "staged_bytes": staged_bytes,
+        }
+
     def _transfer_sharded_tensor(
         self,
         name: str,
         item: dict[str, Any],
-        source_state: dict[str, torch.Tensor] | None,
+        source_state: dict[Any, torch.Tensor] | None,
+        *,
+        source_key: Any | None = None,
     ) -> torch.Tensor | None:
         shape = tuple(int(v) for v in item["shape"])
         if not shape:
@@ -238,7 +397,7 @@ class FSDPResizeStateTransferManager:
 
         if self.global_rank in self.old_ranks:
             assert source_state is not None
-            source_value = source_state.get(name)
+            source_value = source_state.get(name if source_key is None else source_key)
             if not isinstance(source_value, DTensor):
                 raise RuntimeError(f"source FSDP state tensor {name} is not a DTensor")
             source_local = source_value.to_local().detach().to(self.device, non_blocking=True)
@@ -334,6 +493,26 @@ def stage_fsdp2_model_state(
 
 
 @torch.no_grad()
+def stage_fsdp2_optimizer_state(
+    model: torch.nn.Module | None,
+    optimizer: torch.optim.Optimizer | None,
+    *,
+    old_ranks: list[int],
+    new_ranks: list[int],
+    transfer_group: dist.ProcessGroup,
+    device: torch.device,
+) -> tuple[dict[str, Any] | None, dict[str, int]]:
+    """Stage name-keyed optimizer state with direct local-shard transfers."""
+    manager = FSDPResizeStateTransferManager(
+        old_ranks=old_ranks,
+        new_ranks=new_ranks,
+        transfer_group=transfer_group,
+        device=device,
+    )
+    return manager.stage_optimizer(model, optimizer)
+
+
+@torch.no_grad()
 def restore_fsdp2_model_state(
     model: torch.nn.Module,
     staged_state: dict[str, torch.Tensor],
@@ -365,3 +544,78 @@ def restore_fsdp2_model_state(
 
     get_torch_device().synchronize()
     return {"tensor_count": len(copy_plan), "restored_bytes": restored_bytes}
+
+
+@torch.no_grad()
+def restore_fsdp2_optimizer_state(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    staged_state: dict[str, Any],
+) -> dict[str, int]:
+    """Restore name-keyed optimizer shards into a rebuilt FSDP2 optimizer."""
+    manifest = staged_state.get("manifest")
+    staged_param_groups = staged_state.get("param_groups")
+    state = staged_state.get("state")
+    if not isinstance(manifest, list) or not isinstance(staged_param_groups, list) or not isinstance(state, dict):
+        raise RuntimeError("invalid staged FSDP optimizer state")
+
+    parameters_by_name = dict(model.named_parameters())
+    name_by_parameter_id = {id(parameter): name for name, parameter in parameters_by_name.items()}
+    if len(staged_param_groups) != len(optimizer.param_groups):
+        raise RuntimeError(
+            "optimizer parameter group count changed during resize: "
+            f"staged={len(staged_param_groups)}, target={len(optimizer.param_groups)}"
+        )
+    for index, (staged_group, target_group) in enumerate(zip(staged_param_groups, optimizer.param_groups, strict=True)):
+        target_names = [name_by_parameter_id.get(id(parameter)) for parameter in target_group["params"]]
+        if target_names != staged_group.get("parameter_names"):
+            raise RuntimeError(f"optimizer parameter group {index} changed during resize")
+        target_group.update(copy.deepcopy(staged_group["options"]))
+
+    expected_keys = {(str(item["parameter_name"]), str(item["state_name"])) for item in manifest}
+    if set(state) != expected_keys:
+        missing = sorted(expected_keys - set(state))
+        unexpected = sorted(set(state) - expected_keys)
+        raise RuntimeError(
+            f"optimizer resize state keys do not match manifest: missing={missing[:8]}, unexpected={unexpected[:8]}"
+        )
+
+    optimizer.state.clear()
+    restored_bytes = 0
+    for item in manifest:
+        parameter_name = str(item["parameter_name"])
+        state_name = str(item["state_name"])
+        parameter = parameters_by_name.get(parameter_name)
+        if parameter is None:
+            raise RuntimeError(f"optimizer parameter {parameter_name} is absent from the rebuilt model")
+        staged_value = state[(parameter_name, state_name)]
+        kind = str(item["kind"])
+        if kind == "sharded_tensor":
+            if not isinstance(parameter, DTensor) or not isinstance(staged_value, torch.Tensor):
+                raise RuntimeError(f"cannot restore sharded optimizer state {parameter_name}.{state_name}")
+            target_value = torch.zeros_like(parameter, dtype=staged_value.dtype, requires_grad=False)
+            if not isinstance(target_value, DTensor):
+                raise RuntimeError(f"rebuilt optimizer state {parameter_name}.{state_name} is not a DTensor")
+            target_local = target_value.to_local()
+            if tuple(target_local.shape) != tuple(staged_value.shape):
+                raise RuntimeError(
+                    f"optimizer local shape mismatch for {parameter_name}.{state_name}: "
+                    f"target={tuple(target_local.shape)}, staged={tuple(staged_value.shape)}"
+                )
+            target_local.copy_(staged_value.to(device=target_local.device, dtype=target_local.dtype))
+            restored_value: Any = target_value
+            restored_bytes += staged_value.numel() * staged_value.element_size()
+        elif kind == "scalar_tensor":
+            dtype = _resolve_dtype(str(item["dtype"]))
+            device_type = str(item.get("device_type", "cpu"))
+            device = torch.device("cpu") if device_type == "cpu" else parameter.to_local().device
+            restored_value = torch.tensor(staged_value, dtype=dtype, device=device).reshape(tuple(item["shape"]))
+            restored_bytes += restored_value.numel() * restored_value.element_size()
+        elif kind == "value":
+            restored_value = copy.deepcopy(staged_value)
+        else:
+            raise RuntimeError(f"unsupported optimizer resize state kind: {kind}")
+        optimizer.state[parameter][state_name] = restored_value
+
+    get_torch_device().synchronize()
+    return {"tensor_count": len(manifest), "restored_bytes": restored_bytes}

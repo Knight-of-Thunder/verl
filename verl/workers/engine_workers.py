@@ -680,11 +680,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.ref.destroy_process_group()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def stage_actor_model_for_resize(self, old_ranks: list[int], new_ranks: list[int]):
-        """Stage actor model shards for a GPU-direct FSDP2 resize."""
+    def stage_actor_model_for_resize(
+        self,
+        old_ranks: list[int],
+        new_ranks: list[int],
+        transfer_optimizer: bool = False,
+    ):
+        """Stage actor model and optional optimizer shards for a GPU-direct FSDP2 resize."""
         if self.actor is None:
             raise RuntimeError("actor runtime shell is unavailable")
-        return self.actor.engine.stage_model_for_resize(old_ranks, new_ranks)
+        return self.actor.engine.stage_model_for_resize(old_ranks, new_ranks, transfer_optimizer)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def restore_actor_model_after_resize(self):
