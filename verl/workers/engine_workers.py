@@ -685,11 +685,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         old_ranks: list[int],
         new_ranks: list[int],
         transfer_optimizer: bool = False,
+        global_step: int = 0,
     ):
         """Stage actor model and optional optimizer shards for a GPU-direct FSDP2 resize."""
         if self.actor is None:
             raise RuntimeError("actor runtime shell is unavailable")
-        return self.actor.engine.stage_model_for_resize(old_ranks, new_ranks, transfer_optimizer)
+        return self.actor.engine.stage_model_for_resize(old_ranks, new_ranks, transfer_optimizer, global_step)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def restore_actor_model_after_resize(self):

@@ -287,6 +287,11 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/handoff_scheduler_transfer_success": 0.0,
             "resize/handoff_scheduler_transfer_state_entry_count": 0.0,
             "resize/handoff_scheduler_transfer_fallback_reason": "",
+            "resize/handoff_rng_transfer_status": "disabled",
+            "resize/handoff_rng_transfer_success": 0.0,
+            "resize/handoff_rng_transfer_preserved_ranks": 0.0,
+            "resize/handoff_rng_transfer_derived_ranks": 0.0,
+            "resize/handoff_rng_transfer_fallback_reason": "",
         }
 
     def _build_resize_control_metrics(self, snapshot: dict[str, float | str | int]) -> dict[str, float | str | int]:
@@ -875,6 +880,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             old_ranks,
             new_ranks,
             transfer_optimizer,
+            self.global_steps,
         )
         target_results = [result for result in results if result.get("status") == "staged"]
         if len(target_results) != actor_target:
@@ -900,6 +906,12 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             raise RuntimeError(
                 f"GPU-direct scheduler resize returned inconsistent state entry counts: {scheduler_state_entry_counts}"
             )
+        if any(result.get("rng_status") != "staged" for result in target_results):
+            raise RuntimeError("GPU-direct RNG resize did not stage every target rank")
+        rng_preserved_ranks = sum(result.get("rng_mode") == "preserved" for result in target_results)
+        rng_derived_ranks = sum(result.get("rng_mode") == "derived" for result in target_results)
+        if rng_preserved_ranks + rng_derived_ranks != actor_target:
+            raise RuntimeError("GPU-direct RNG resize returned an invalid target rank mapping")
         logger.info(
             "[one-step-off][resize] staged actor model directly on %s ranks: tensors=%s bytes=%s",
             actor_target,
@@ -921,6 +933,11 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/handoff_scheduler_transfer_success": 0.0,
             "resize/handoff_scheduler_transfer_state_entry_count": float(next(iter(scheduler_state_entry_counts))),
             "resize/handoff_scheduler_transfer_fallback_reason": "",
+            "resize/handoff_rng_transfer_status": "staged",
+            "resize/handoff_rng_transfer_success": 0.0,
+            "resize/handoff_rng_transfer_preserved_ranks": float(rng_preserved_ranks),
+            "resize/handoff_rng_transfer_derived_ranks": float(rng_derived_ranks),
+            "resize/handoff_rng_transfer_fallback_reason": "",
         }
 
     def _restore_gpu_direct_actor_model(self) -> dict[str, float | str | int]:
@@ -940,6 +957,13 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         if self._host_staging_config.stage_optimizer and not scheduler_restored:
             raise RuntimeError("GPU-direct scheduler resize did not restore every target rank")
         scheduler_state_entry_count = max(int(result.get("scheduler_state_entry_count", 0)) for result in restored)
+        rng_restored = all(result.get("rng_status") == "restored" for result in restored)
+        if not rng_restored:
+            raise RuntimeError("GPU-direct RNG resize did not restore every target rank")
+        rng_preserved_ranks = sum(result.get("rng_mode") == "preserved" for result in restored)
+        rng_derived_ranks = sum(result.get("rng_mode") == "derived" for result in restored)
+        if rng_preserved_ranks + rng_derived_ranks != self.actor_wg.world_size:
+            raise RuntimeError("GPU-direct RNG resize restored an invalid target rank mapping")
         logger.info(
             "[one-step-off][resize] restored actor model directly on %s ranks: tensors=%s bytes=%s",
             self.actor_wg.world_size,
@@ -963,6 +987,11 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/handoff_scheduler_transfer_success": 1.0 if scheduler_restored else 0.0,
             "resize/handoff_scheduler_transfer_state_entry_count": float(scheduler_state_entry_count),
             "resize/handoff_scheduler_transfer_fallback_reason": "",
+            "resize/handoff_rng_transfer_status": "restored",
+            "resize/handoff_rng_transfer_success": 1.0,
+            "resize/handoff_rng_transfer_preserved_ranks": float(rng_preserved_ranks),
+            "resize/handoff_rng_transfer_derived_ranks": float(rng_derived_ranks),
+            "resize/handoff_rng_transfer_fallback_reason": "",
         }
 
     def _clear_gpu_direct_actor_model(self) -> None:
@@ -1235,6 +1264,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                         "resize/handoff_scheduler_transfer_status": "fallback",
                         "resize/handoff_scheduler_transfer_success": 0.0,
                         "resize/handoff_scheduler_transfer_fallback_reason": str(exc),
+                        "resize/handoff_rng_transfer_status": "fallback",
+                        "resize/handoff_rng_transfer_success": 0.0,
+                        "resize/handoff_rng_transfer_fallback_reason": str(exc),
                     }
                 )
 
@@ -1268,6 +1300,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                             "resize/handoff_scheduler_transfer_status": "fallback",
                             "resize/handoff_scheduler_transfer_success": 0.0,
                             "resize/handoff_scheduler_transfer_fallback_reason": str(exc),
+                            "resize/handoff_rng_transfer_status": "fallback",
+                            "resize/handoff_rng_transfer_success": 0.0,
+                            "resize/handoff_rng_transfer_fallback_reason": str(exc),
                         }
                     )
 
@@ -1283,6 +1318,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                         "resize/handoff_model_transfer_",
                         "resize/handoff_optimizer_transfer_",
                         "resize/handoff_scheduler_transfer_",
+                        "resize/handoff_rng_transfer_",
                     )
                 )
             }

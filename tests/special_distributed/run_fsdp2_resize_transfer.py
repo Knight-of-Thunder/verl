@@ -21,7 +21,9 @@ Set ``OLD_WORLD_SIZE=6 NEW_WORLD_SIZE=4`` to exercise actor scale-down.
 """
 
 import os
+import random
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -29,9 +31,11 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import fully_shard
 
 from verl.utils.fsdp_resize import (
+    restore_actor_rng_state,
     restore_fsdp2_model_state,
     restore_fsdp2_optimizer_state,
     restore_fsdp2_scheduler_state,
+    stage_actor_rng_state,
     stage_fsdp2_model_state,
     stage_fsdp2_optimizer_state,
     stage_fsdp2_scheduler_state,
@@ -57,6 +61,17 @@ def _optimizer_step(model: nn.Module, optimizer: torch.optim.Optimizer, step_ind
 
 def _build_scheduler(optimizer: torch.optim.Optimizer) -> torch.optim.lr_scheduler.LRScheduler:
     return get_constant_schedule_with_warmup(optimizer, num_warmup_steps=4)
+
+
+def _seed_rng(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+
+def _draw_rng() -> tuple[float, float, torch.Tensor, torch.Tensor]:
+    return random.random(), float(np.random.random()), torch.rand(4), torch.rand(4, device="cuda").cpu()
 
 
 def _assert_model_matches(actual_model: nn.Module, expected_model: nn.Module) -> None:
@@ -138,6 +153,19 @@ def main() -> None:
         device=torch.device("cuda", local_rank),
     )
     assert (staged_scheduler_state is not None) == (rank in new_ranks)
+    _seed_rng(7000 + rank)
+    staged_rng_state = stage_actor_rng_state(
+        old_ranks=old_ranks,
+        new_ranks=new_ranks,
+        global_rank=rank,
+        base_seed=42,
+        global_step=5,
+    )
+    assert (staged_rng_state is not None) == (rank in new_ranks)
+    expected_rng_draw = None
+    if staged_rng_state is not None:
+        restore_actor_rng_state(staged_rng_state)
+        expected_rng_draw = _draw_rng()
 
     del old_model
     del old_optimizer
@@ -165,6 +193,8 @@ def main() -> None:
         assert staged_state is not None
         assert staged_optimizer_state is not None
         assert staged_scheduler_state is not None
+        assert staged_rng_state is not None
+        assert expected_rng_draw is not None
         restore_fsdp2_model_state(new_model, staged_state)
         restore_fsdp2_optimizer_state(new_model, new_optimizer, staged_optimizer_state)
         restore_fsdp2_scheduler_state(new_scheduler, staged_scheduler_state)
@@ -178,6 +208,12 @@ def main() -> None:
         _assert_optimizer_matches(new_model, new_optimizer, expected_model, expected_optimizer)
         assert new_scheduler.state_dict() == expected_scheduler.state_dict()
         assert new_scheduler.get_last_lr() == expected_scheduler.get_last_lr()
+
+        restore_actor_rng_state(staged_rng_state)
+        actual_rng_draw = _draw_rng()
+        assert actual_rng_draw[:2] == expected_rng_draw[:2]
+        torch.testing.assert_close(actual_rng_draw[2], expected_rng_draw[2], rtol=0, atol=0)
+        torch.testing.assert_close(actual_rng_draw[3], expected_rng_draw[3], rtol=0, atol=0)
 
         _optimizer_step(new_model, new_optimizer, step_index=1)
         _optimizer_step(expected_model, expected_optimizer, step_index=1)

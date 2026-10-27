@@ -110,10 +110,11 @@ def test_dynamic_resize_recipe_enables_gpu_direct_model_and_optimizer_handoff():
 
 def test_gpu_direct_model_stage_uses_active_and_target_actor_ranks():
     class _PhysicalWorkerGroup:
-        def stage_actor_model_for_resize(self, old_ranks, new_ranks, transfer_optimizer):
+        def stage_actor_model_for_resize(self, old_ranks, new_ranks, transfer_optimizer, global_step):
             assert old_ranks == [0, 1, 2, 3]
             assert new_ranks == [0, 1, 2, 3, 4, 5]
             assert transfer_optimizer is True
+            assert global_step == 9
             return [
                 {
                     "status": "staged",
@@ -124,8 +125,10 @@ def test_gpu_direct_model_stage_uses_active_and_target_actor_ranks():
                     "optimizer_staged_bytes": 20,
                     "scheduler_status": "staged",
                     "scheduler_state_entry_count": 8,
+                    "rng_status": "staged",
+                    "rng_mode": "preserved" if index < 4 else "derived",
                 }
-                for _ in range(6)
+                for index in range(6)
             ] + [
                 {
                     "status": "non_member",
@@ -136,6 +139,8 @@ def test_gpu_direct_model_stage_uses_active_and_target_actor_ranks():
                     "optimizer_staged_bytes": 0,
                     "scheduler_status": "non_member",
                     "scheduler_state_entry_count": 0,
+                    "rng_status": "non_member",
+                    "rng_mode": "",
                 }
                 for _ in range(2)
             ]
@@ -144,6 +149,7 @@ def test_gpu_direct_model_stage_uses_active_and_target_actor_ranks():
     trainer._active_dynamic_resize_topology = {"actor_size": 4, "rollout_size": 4}
     trainer._physical_actor_rollout_wg = _PhysicalWorkerGroup()
     trainer._host_staging_config = HostStagingConfig.from_dict({"stage_optimizer": True})
+    trainer.global_steps = 9
 
     metrics = trainer._stage_gpu_direct_actor_model(actor_target=6)
 
@@ -156,14 +162,17 @@ def test_gpu_direct_model_stage_uses_active_and_target_actor_ranks():
     assert metrics["resize/handoff_optimizer_transfer_bytes"] == 120.0
     assert metrics["resize/handoff_scheduler_transfer_status"] == "staged"
     assert metrics["resize/handoff_scheduler_transfer_state_entry_count"] == 8.0
+    assert metrics["resize/handoff_rng_transfer_preserved_ranks"] == 4.0
+    assert metrics["resize/handoff_rng_transfer_derived_ranks"] == 2.0
 
 
 def test_gpu_direct_model_stage_accepts_source_only_ranks_during_actor_scale_down():
     class _PhysicalWorkerGroup:
-        def stage_actor_model_for_resize(self, old_ranks, new_ranks, transfer_optimizer):
+        def stage_actor_model_for_resize(self, old_ranks, new_ranks, transfer_optimizer, global_step):
             assert old_ranks == [0, 1, 2, 3, 4, 5]
             assert new_ranks == [0, 1, 2, 3]
             assert transfer_optimizer is True
+            assert global_step == 11
             return (
                 [
                     {
@@ -175,6 +184,8 @@ def test_gpu_direct_model_stage_accepts_source_only_ranks_during_actor_scale_dow
                         "optimizer_staged_bytes": 25,
                         "scheduler_status": "staged",
                         "scheduler_state_entry_count": 8,
+                        "rng_status": "staged",
+                        "rng_mode": "preserved",
                     }
                     for _ in range(4)
                 ]
@@ -188,6 +199,8 @@ def test_gpu_direct_model_stage_accepts_source_only_ranks_during_actor_scale_dow
                         "optimizer_staged_bytes": 0,
                         "scheduler_status": "source_only",
                         "scheduler_state_entry_count": 8,
+                        "rng_status": "source_only",
+                        "rng_mode": "",
                     }
                     for _ in range(2)
                 ]
@@ -201,6 +214,8 @@ def test_gpu_direct_model_stage_accepts_source_only_ranks_during_actor_scale_dow
                         "optimizer_staged_bytes": 0,
                         "scheduler_status": "non_member",
                         "scheduler_state_entry_count": 0,
+                        "rng_status": "non_member",
+                        "rng_mode": "",
                     }
                     for _ in range(2)
                 ]
@@ -210,6 +225,7 @@ def test_gpu_direct_model_stage_accepts_source_only_ranks_during_actor_scale_dow
     trainer._active_dynamic_resize_topology = {"actor_size": 6, "rollout_size": 2}
     trainer._physical_actor_rollout_wg = _PhysicalWorkerGroup()
     trainer._host_staging_config = HostStagingConfig.from_dict({"stage_optimizer": True})
+    trainer.global_steps = 11
 
     metrics = trainer._stage_gpu_direct_actor_model(actor_target=4)
 
@@ -220,6 +236,8 @@ def test_gpu_direct_model_stage_accepts_source_only_ranks_during_actor_scale_dow
     assert metrics["resize/handoff_optimizer_transfer_tensor_count"] == 15.0
     assert metrics["resize/handoff_optimizer_transfer_bytes"] == 100.0
     assert metrics["resize/handoff_scheduler_transfer_state_entry_count"] == 8.0
+    assert metrics["resize/handoff_rng_transfer_preserved_ranks"] == 4.0
+    assert metrics["resize/handoff_rng_transfer_derived_ranks"] == 0.0
 
 
 def test_gpu_direct_restore_requires_optimizer_on_every_target_rank():
@@ -237,8 +255,10 @@ def test_gpu_direct_restore_requires_optimizer_on_every_target_rank():
                     "optimizer_restored_bytes": 20,
                     "scheduler_status": "restored",
                     "scheduler_state_entry_count": 8,
+                    "rng_status": "restored",
+                    "rng_mode": "preserved" if index == 0 else "derived",
                 }
-                for _ in range(2)
+                for index in range(2)
             ]
 
     trainer = object.__new__(OneStepOffRayTrainer)
@@ -255,6 +275,9 @@ def test_gpu_direct_restore_requires_optimizer_on_every_target_rank():
     assert metrics["resize/handoff_scheduler_transfer_status"] == "restored"
     assert metrics["resize/handoff_scheduler_transfer_success"] == 1.0
     assert metrics["resize/handoff_scheduler_transfer_state_entry_count"] == 8.0
+    assert metrics["resize/handoff_rng_transfer_success"] == 1.0
+    assert metrics["resize/handoff_rng_transfer_preserved_ranks"] == 1.0
+    assert metrics["resize/handoff_rng_transfer_derived_ranks"] == 1.0
 
 
 def test_dynamic_resize_checkpoint_load_can_skip_actor_for_gpu_direct_restore():

@@ -14,7 +14,20 @@
 
 import pytest
 
-from verl.utils.fsdp_resize import FSDPResizeOverlapPlanner, ShardOverlap, compute_1d_shard_range
+from verl.utils.fsdp_resize import (
+    FSDPResizeOverlapPlanner,
+    ShardOverlap,
+    compute_1d_shard_range,
+    derive_actor_resize_seed,
+)
+
+
+def test_derived_actor_resize_seed_is_stable_and_rank_specific():
+    seeds = [derive_actor_resize_seed(base_seed=42, global_step=9, rank=rank) for rank in range(8)]
+
+    assert seeds == [derive_actor_resize_seed(base_seed=42, global_step=9, rank=rank) for rank in range(8)]
+    assert len(set(seeds)) == len(seeds)
+    assert seeds != [derive_actor_resize_seed(base_seed=42, global_step=10, rank=rank) for rank in range(8)]
 
 
 @pytest.mark.parametrize(

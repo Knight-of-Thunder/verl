@@ -40,9 +40,11 @@ from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_resize import (
+    restore_actor_rng_state,
     restore_fsdp2_model_state,
     restore_fsdp2_optimizer_state,
     restore_fsdp2_scheduler_state,
+    stage_actor_rng_state,
     stage_fsdp2_model_state,
     stage_fsdp2_optimizer_state,
     stage_fsdp2_scheduler_state,
@@ -127,6 +129,7 @@ class FSDPEngine(BaseEngine):
         self._resize_model_state: dict[str, torch.Tensor] | None = None
         self._resize_optimizer_state: dict | None = None
         self._resize_scheduler_state: dict | None = None
+        self._resize_rng_state: dict | None = None
         self._resize_optimizer_required = False
 
         # Apply NPU patches for FSDP backend
@@ -218,6 +221,7 @@ class FSDPEngine(BaseEngine):
         old_ranks: list[int],
         new_ranks: list[int],
         transfer_optimizer: bool = False,
+        global_step: int = 0,
     ) -> dict[str, int | str]:
         """Stage this rank's target FSDP2 model and optimizer shards."""
         import socket
@@ -255,6 +259,7 @@ class FSDPEngine(BaseEngine):
                 self._resize_model_state = None
                 self._resize_optimizer_state = None
                 self._resize_scheduler_state = None
+                self._resize_rng_state = None
                 self._resize_optimizer_required = transfer_optimizer
                 result = {
                     "status": "non_member",
@@ -265,6 +270,8 @@ class FSDPEngine(BaseEngine):
                     "optimizer_staged_bytes": 0,
                     "scheduler_status": "non_member" if transfer_optimizer else "disabled",
                     "scheduler_state_entry_count": 0,
+                    "rng_status": "non_member",
+                    "rng_mode": "",
                 }
             else:
                 model = self.module if global_rank in old_ranks else None
@@ -297,9 +304,17 @@ class FSDPEngine(BaseEngine):
                         transfer_group=transfer_group,
                         device=torch.device(device_name, get_device_id()),
                     )
+                rng_state = stage_actor_rng_state(
+                    old_ranks=old_ranks,
+                    new_ranks=new_ranks,
+                    global_rank=global_rank,
+                    base_seed=self.engine_config.seed,
+                    global_step=global_step,
+                )
                 self._resize_model_state = staged_state
                 self._resize_optimizer_state = optimizer_state
                 self._resize_scheduler_state = scheduler_state
+                self._resize_rng_state = rng_state
                 self._resize_optimizer_required = transfer_optimizer
                 result = {
                     "status": "staged" if staged_state is not None else "source_only",
@@ -313,6 +328,8 @@ class FSDPEngine(BaseEngine):
                     if transfer_optimizer
                     else "disabled",
                     "scheduler_state_entry_count": scheduler_stats["state_entry_count"],
+                    "rng_status": "staged" if rng_state is not None else "source_only",
+                    "rng_mode": str(rng_state.get("mode", "")) if rng_state is not None else "",
                 }
             if global_rank in transfer_ranks:
                 torch.distributed.barrier(group=transfer_group)
@@ -347,9 +364,13 @@ class FSDPEngine(BaseEngine):
             )
         else:
             scheduler_stats = {"state_entry_count": 0}
+        if self._resize_rng_state is None:
+            raise RuntimeError("no actor RNG state is staged on this actor rank")
+        rng_stats = restore_actor_rng_state(self._resize_rng_state)
         self._resize_model_state = None
         self._resize_optimizer_state = None
         self._resize_scheduler_state = None
+        self._resize_rng_state = None
         self._resize_optimizer_required = False
         aggressive_empty_cache(force_sync=True)
         return {
@@ -360,12 +381,15 @@ class FSDPEngine(BaseEngine):
             "optimizer_restored_bytes": optimizer_stats["restored_bytes"],
             "scheduler_status": "restored" if optimizer_required else "disabled",
             "scheduler_state_entry_count": scheduler_stats["state_entry_count"],
+            "rng_status": "restored",
+            "rng_mode": rng_stats["mode"],
         }
 
     def clear_staged_model_resize_state(self) -> None:
         self._resize_model_state = None
         self._resize_optimizer_state = None
         self._resize_scheduler_state = None
+        self._resize_rng_state = None
         self._resize_optimizer_required = False
         aggressive_empty_cache(force_sync=True)
 

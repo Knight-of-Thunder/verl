@@ -970,8 +970,11 @@ memory can include the old model and optimizer plus staged target model and
 optimizer shards.
 
 LR scheduler progress is transferred as replicated metadata in the same
-temporary communicator and restored after the optimizer. RNG state remains a
-separate continuation requirement.
+temporary communicator and restored after the optimizer. Surviving actor
+ranks also restore their Python, NumPy, Torch CPU, and accelerator RNG streams;
+new actor ranks receive deterministic rank-specific seeds. Dataloader-owned
+generators, rollout-server sampling RNG, critic RNG, and bitwise equivalence
+across different world sizes remain separate continuation requirements.
 
 This prototype is not yet suitable for large models close to device capacity.
 Production hardening must add:

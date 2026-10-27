@@ -17,15 +17,18 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import random
 from dataclasses import dataclass
 from math import prod
 from typing import Any
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
-from verl.utils.device import get_torch_device
+from verl.utils.device import get_device_name, get_torch_device
 
 
 def compute_1d_shard_range(dim_size: int, world_size: int, rank: int) -> tuple[int, int]:
@@ -110,6 +113,71 @@ def _resolve_dtype(name: str) -> torch.dtype:
     if not isinstance(dtype, torch.dtype):
         raise ValueError(f"Unsupported tensor dtype in resize manifest: {name}")
     return dtype
+
+
+def derive_actor_resize_seed(base_seed: int, global_step: int, rank: int) -> int:
+    """Derive a stable independent seed for a newly added actor rank."""
+    payload = f"{int(base_seed)}:{int(global_step)}:{int(rank)}".encode()
+    return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little") % (2**32)
+
+
+def capture_actor_rng_state() -> dict[str, Any]:
+    """Capture process-global actor RNG streams before runtime reconstruction."""
+    state: dict[str, Any] = {
+        "mode": "preserved",
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state().clone(),
+    }
+    if get_device_name() != "cpu":
+        state["device"] = get_torch_device().get_rng_state().clone()
+    return state
+
+
+def stage_actor_rng_state(
+    *,
+    old_ranks: list[int],
+    new_ranks: list[int],
+    global_rank: int,
+    base_seed: int,
+    global_step: int,
+) -> dict[str, Any] | None:
+    """Preserve surviving rank streams or derive a stream for a new actor rank."""
+    if global_rank not in new_ranks:
+        return None
+    if global_rank in old_ranks:
+        return capture_actor_rng_state()
+    return {
+        "mode": "derived",
+        "seed": derive_actor_resize_seed(base_seed, global_step, global_rank),
+    }
+
+
+def restore_actor_rng_state(staged_state: dict[str, Any]) -> dict[str, int | str]:
+    """Restore a preserved RNG stream or seed a newly added actor rank."""
+    mode = str(staged_state.get("mode", ""))
+    if mode == "preserved":
+        required = {"python", "numpy", "torch_cpu"}
+        missing = sorted(required - set(staged_state))
+        if missing:
+            raise RuntimeError(f"staged actor RNG state is missing entries: {missing}")
+        random.setstate(staged_state["python"])
+        np.random.set_state(staged_state["numpy"])
+        torch.set_rng_state(staged_state["torch_cpu"])
+        if get_device_name() != "cpu":
+            if "device" not in staged_state:
+                raise RuntimeError("staged actor RNG state is missing the accelerator stream")
+            get_torch_device().set_rng_state(staged_state["device"])
+        return {"mode": mode, "seed": -1}
+    if mode == "derived":
+        seed = int(staged_state["seed"])
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if get_device_name() != "cpu":
+            get_torch_device().manual_seed(seed)
+        return {"mode": mode, "seed": seed}
+    raise RuntimeError(f"unsupported staged actor RNG mode: {mode}")
 
 
 def _build_manifest(model: torch.nn.Module) -> list[dict[str, Any]]:
