@@ -380,6 +380,35 @@ class FSDPResizeStateTransferManager:
             "staged_bytes": staged_bytes,
         }
 
+    @torch.no_grad()
+    def stage_scheduler(
+        self,
+        scheduler: torch.optim.lr_scheduler.LRScheduler | None,
+    ) -> tuple[dict[str, Any] | None, dict[str, int]]:
+        """Broadcast replicated scheduler metadata to the target actor ranks."""
+        is_old_rank = self.global_rank in self.old_ranks
+        is_new_rank = self.global_rank in self.new_ranks
+        if is_old_rank and scheduler is None:
+            raise RuntimeError(f"old actor rank {self.global_rank} has no active LR scheduler")
+
+        object_list = [
+            copy.deepcopy(scheduler.state_dict())
+            if self.global_rank == self.source_rank and scheduler is not None
+            else None
+        ]
+        dist.broadcast_object_list(
+            object_list,
+            src=self.source_rank,
+            group=self.transfer_group,
+            device=self.device,
+        )
+        scheduler_state = object_list[0]
+        if not isinstance(scheduler_state, dict):
+            raise RuntimeError("received an invalid FSDP scheduler resize state")
+        return (copy.deepcopy(scheduler_state) if is_new_rank else None), {
+            "state_entry_count": len(scheduler_state),
+        }
+
     def _transfer_sharded_tensor(
         self,
         name: str,
@@ -513,6 +542,25 @@ def stage_fsdp2_optimizer_state(
 
 
 @torch.no_grad()
+def stage_fsdp2_scheduler_state(
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None,
+    *,
+    old_ranks: list[int],
+    new_ranks: list[int],
+    transfer_group: dist.ProcessGroup,
+    device: torch.device,
+) -> tuple[dict[str, Any] | None, dict[str, int]]:
+    """Stage replicated LR scheduler metadata on target actor ranks."""
+    manager = FSDPResizeStateTransferManager(
+        old_ranks=old_ranks,
+        new_ranks=new_ranks,
+        transfer_group=transfer_group,
+        device=device,
+    )
+    return manager.stage_scheduler(scheduler)
+
+
+@torch.no_grad()
 def restore_fsdp2_model_state(
     model: torch.nn.Module,
     staged_state: dict[str, torch.Tensor],
@@ -619,3 +667,12 @@ def restore_fsdp2_optimizer_state(
 
     get_torch_device().synchronize()
     return {"tensor_count": len(manifest), "restored_bytes": restored_bytes}
+
+
+def restore_fsdp2_scheduler_state(
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    staged_state: dict[str, Any],
+) -> dict[str, int]:
+    """Restore replicated LR scheduler progress after optimizer reconstruction."""
+    scheduler.load_state_dict(copy.deepcopy(staged_state))
+    return {"state_entry_count": len(staged_state)}

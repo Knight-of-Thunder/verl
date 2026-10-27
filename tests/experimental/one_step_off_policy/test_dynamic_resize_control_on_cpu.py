@@ -122,6 +122,8 @@ def test_gpu_direct_model_stage_uses_active_and_target_actor_ranks():
                     "optimizer_status": "staged",
                     "optimizer_tensor_count": 15,
                     "optimizer_staged_bytes": 20,
+                    "scheduler_status": "staged",
+                    "scheduler_state_entry_count": 8,
                 }
                 for _ in range(6)
             ] + [
@@ -132,6 +134,8 @@ def test_gpu_direct_model_stage_uses_active_and_target_actor_ranks():
                     "optimizer_status": "non_member",
                     "optimizer_tensor_count": 0,
                     "optimizer_staged_bytes": 0,
+                    "scheduler_status": "non_member",
+                    "scheduler_state_entry_count": 0,
                 }
                 for _ in range(2)
             ]
@@ -150,6 +154,8 @@ def test_gpu_direct_model_stage_uses_active_and_target_actor_ranks():
     assert metrics["resize/handoff_optimizer_transfer_status"] == "staged"
     assert metrics["resize/handoff_optimizer_transfer_tensor_count"] == 15.0
     assert metrics["resize/handoff_optimizer_transfer_bytes"] == 120.0
+    assert metrics["resize/handoff_scheduler_transfer_status"] == "staged"
+    assert metrics["resize/handoff_scheduler_transfer_state_entry_count"] == 8.0
 
 
 def test_gpu_direct_model_stage_accepts_source_only_ranks_during_actor_scale_down():
@@ -167,6 +173,8 @@ def test_gpu_direct_model_stage_accepts_source_only_ranks_during_actor_scale_dow
                         "optimizer_status": "staged",
                         "optimizer_tensor_count": 15,
                         "optimizer_staged_bytes": 25,
+                        "scheduler_status": "staged",
+                        "scheduler_state_entry_count": 8,
                     }
                     for _ in range(4)
                 ]
@@ -178,6 +186,8 @@ def test_gpu_direct_model_stage_accepts_source_only_ranks_during_actor_scale_dow
                         "optimizer_status": "source_only",
                         "optimizer_tensor_count": 15,
                         "optimizer_staged_bytes": 0,
+                        "scheduler_status": "source_only",
+                        "scheduler_state_entry_count": 8,
                     }
                     for _ in range(2)
                 ]
@@ -189,6 +199,8 @@ def test_gpu_direct_model_stage_accepts_source_only_ranks_during_actor_scale_dow
                         "optimizer_status": "non_member",
                         "optimizer_tensor_count": 0,
                         "optimizer_staged_bytes": 0,
+                        "scheduler_status": "non_member",
+                        "scheduler_state_entry_count": 0,
                     }
                     for _ in range(2)
                 ]
@@ -207,6 +219,7 @@ def test_gpu_direct_model_stage_accepts_source_only_ranks_during_actor_scale_dow
     assert metrics["resize/handoff_model_transfer_bytes"] == 60.0
     assert metrics["resize/handoff_optimizer_transfer_tensor_count"] == 15.0
     assert metrics["resize/handoff_optimizer_transfer_bytes"] == 100.0
+    assert metrics["resize/handoff_scheduler_transfer_state_entry_count"] == 8.0
 
 
 def test_gpu_direct_restore_requires_optimizer_on_every_target_rank():
@@ -222,6 +235,8 @@ def test_gpu_direct_restore_requires_optimizer_on_every_target_rank():
                     "optimizer_status": "restored",
                     "optimizer_tensor_count": 15,
                     "optimizer_restored_bytes": 20,
+                    "scheduler_status": "restored",
+                    "scheduler_state_entry_count": 8,
                 }
                 for _ in range(2)
             ]
@@ -237,6 +252,9 @@ def test_gpu_direct_restore_requires_optimizer_on_every_target_rank():
     assert metrics["resize/handoff_optimizer_transfer_success"] == 1.0
     assert metrics["resize/handoff_optimizer_transfer_tensor_count"] == 15.0
     assert metrics["resize/handoff_optimizer_transfer_bytes"] == 40.0
+    assert metrics["resize/handoff_scheduler_transfer_status"] == "restored"
+    assert metrics["resize/handoff_scheduler_transfer_success"] == 1.0
+    assert metrics["resize/handoff_scheduler_transfer_state_entry_count"] == 8.0
 
 
 def test_dynamic_resize_checkpoint_load_can_skip_actor_for_gpu_direct_restore():

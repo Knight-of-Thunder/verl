@@ -42,8 +42,10 @@ from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_resize import (
     restore_fsdp2_model_state,
     restore_fsdp2_optimizer_state,
+    restore_fsdp2_scheduler_state,
     stage_fsdp2_model_state,
     stage_fsdp2_optimizer_state,
+    stage_fsdp2_scheduler_state,
 )
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
@@ -124,6 +126,7 @@ class FSDPEngine(BaseEngine):
         self.process_group = None
         self._resize_model_state: dict[str, torch.Tensor] | None = None
         self._resize_optimizer_state: dict | None = None
+        self._resize_scheduler_state: dict | None = None
         self._resize_optimizer_required = False
 
         # Apply NPU patches for FSDP backend
@@ -251,6 +254,7 @@ class FSDPEngine(BaseEngine):
             if global_rank not in transfer_ranks:
                 self._resize_model_state = None
                 self._resize_optimizer_state = None
+                self._resize_scheduler_state = None
                 self._resize_optimizer_required = transfer_optimizer
                 result = {
                     "status": "non_member",
@@ -259,6 +263,8 @@ class FSDPEngine(BaseEngine):
                     "optimizer_status": "non_member" if transfer_optimizer else "disabled",
                     "optimizer_tensor_count": 0,
                     "optimizer_staged_bytes": 0,
+                    "scheduler_status": "non_member" if transfer_optimizer else "disabled",
+                    "scheduler_state_entry_count": 0,
                 }
             else:
                 model = self.module if global_rank in old_ranks else None
@@ -271,6 +277,8 @@ class FSDPEngine(BaseEngine):
                 )
                 optimizer_state = None
                 optimizer_stats = {"tensor_count": 0, "staged_bytes": 0}
+                scheduler_state = None
+                scheduler_stats = {"state_entry_count": 0}
                 if transfer_optimizer:
                     optimizer = self.optimizer if global_rank in old_ranks else None
                     optimizer_state, optimizer_stats = stage_fsdp2_optimizer_state(
@@ -281,8 +289,17 @@ class FSDPEngine(BaseEngine):
                         transfer_group=transfer_group,
                         device=torch.device(device_name, get_device_id()),
                     )
+                    scheduler = self.lr_scheduler if global_rank in old_ranks else None
+                    scheduler_state, scheduler_stats = stage_fsdp2_scheduler_state(
+                        scheduler,
+                        old_ranks=old_ranks,
+                        new_ranks=new_ranks,
+                        transfer_group=transfer_group,
+                        device=torch.device(device_name, get_device_id()),
+                    )
                 self._resize_model_state = staged_state
                 self._resize_optimizer_state = optimizer_state
+                self._resize_scheduler_state = scheduler_state
                 self._resize_optimizer_required = transfer_optimizer
                 result = {
                     "status": "staged" if staged_state is not None else "source_only",
@@ -292,6 +309,10 @@ class FSDPEngine(BaseEngine):
                     else "disabled",
                     "optimizer_tensor_count": optimizer_stats["tensor_count"],
                     "optimizer_staged_bytes": optimizer_stats["staged_bytes"],
+                    "scheduler_status": ("staged" if scheduler_state is not None else "source_only")
+                    if transfer_optimizer
+                    else "disabled",
+                    "scheduler_state_entry_count": scheduler_stats["state_entry_count"],
                 }
             if global_rank in transfer_ranks:
                 torch.distributed.barrier(group=transfer_group)
@@ -318,8 +339,17 @@ class FSDPEngine(BaseEngine):
                 self.optimizer,
                 self._resize_optimizer_state,
             )
+            if self.lr_scheduler is None or self._resize_scheduler_state is None:
+                raise RuntimeError("no GPU-direct scheduler state is staged on this actor rank")
+            scheduler_stats = restore_fsdp2_scheduler_state(
+                self.lr_scheduler,
+                self._resize_scheduler_state,
+            )
+        else:
+            scheduler_stats = {"state_entry_count": 0}
         self._resize_model_state = None
         self._resize_optimizer_state = None
+        self._resize_scheduler_state = None
         self._resize_optimizer_required = False
         aggressive_empty_cache(force_sync=True)
         return {
@@ -328,11 +358,14 @@ class FSDPEngine(BaseEngine):
             "optimizer_status": "restored" if optimizer_required else "disabled",
             "optimizer_tensor_count": optimizer_stats["tensor_count"],
             "optimizer_restored_bytes": optimizer_stats["restored_bytes"],
+            "scheduler_status": "restored" if optimizer_required else "disabled",
+            "scheduler_state_entry_count": scheduler_stats["state_entry_count"],
         }
 
     def clear_staged_model_resize_state(self) -> None:
         self._resize_model_state = None
         self._resize_optimizer_state = None
+        self._resize_scheduler_state = None
         self._resize_optimizer_required = False
         aggressive_empty_cache(force_sync=True)
 

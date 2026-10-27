@@ -31,9 +31,12 @@ from torch.distributed.fsdp import fully_shard
 from verl.utils.fsdp_resize import (
     restore_fsdp2_model_state,
     restore_fsdp2_optimizer_state,
+    restore_fsdp2_scheduler_state,
     stage_fsdp2_model_state,
     stage_fsdp2_optimizer_state,
+    stage_fsdp2_scheduler_state,
 )
+from verl.utils.torch_functional import get_constant_schedule_with_warmup
 
 
 def _build_model() -> nn.Module:
@@ -50,6 +53,10 @@ def _optimizer_step(model: nn.Module, optimizer: torch.optim.Optimizer, step_ind
     for parameter_index, parameter in enumerate(model.parameters()):
         parameter.grad = torch.full_like(parameter, 0.125 * (step_index + parameter_index + 1))
     optimizer.step()
+
+
+def _build_scheduler(optimizer: torch.optim.Optimizer) -> torch.optim.lr_scheduler.LRScheduler:
+    return get_constant_schedule_with_warmup(optimizer, num_warmup_steps=4)
 
 
 def _assert_model_matches(actual_model: nn.Module, expected_model: nn.Module) -> None:
@@ -91,6 +98,7 @@ def main() -> None:
     old_group = dist.new_group(ranks=old_ranks)
     old_model = None
     old_optimizer = None
+    old_scheduler = None
     if rank in old_ranks:
         old_mesh = DeviceMesh.from_group(
             old_group,
@@ -101,7 +109,9 @@ def main() -> None:
         old_model = _build_model()
         fully_shard(old_model, mesh=old_mesh)
         old_optimizer = torch.optim.AdamW(old_model.parameters(), lr=2e-3, weight_decay=0.03)
+        old_scheduler = _build_scheduler(old_optimizer)
         _optimizer_step(old_model, old_optimizer, step_index=0)
+        old_scheduler.step()
 
     staged_state, _ = stage_fsdp2_model_state(
         old_model,
@@ -120,9 +130,18 @@ def main() -> None:
         device=torch.device("cuda", local_rank),
     )
     assert (staged_optimizer_state is not None) == (rank in new_ranks)
+    staged_scheduler_state, _ = stage_fsdp2_scheduler_state(
+        old_scheduler,
+        old_ranks=old_ranks,
+        new_ranks=new_ranks,
+        transfer_group=dist.group.WORLD,
+        device=torch.device("cuda", local_rank),
+    )
+    assert (staged_scheduler_state is not None) == (rank in new_ranks)
 
     del old_model
     del old_optimizer
+    del old_scheduler
     if rank in old_ranks:
         dist.destroy_process_group(old_group)
     torch.cuda.empty_cache()
@@ -142,25 +161,36 @@ def main() -> None:
                 parameter.zero_()
         fully_shard(new_model, mesh=new_mesh)
         new_optimizer = torch.optim.AdamW(new_model.parameters(), lr=9e-4, weight_decay=0.0)
+        new_scheduler = _build_scheduler(new_optimizer)
         assert staged_state is not None
         assert staged_optimizer_state is not None
+        assert staged_scheduler_state is not None
         restore_fsdp2_model_state(new_model, staged_state)
         restore_fsdp2_optimizer_state(new_model, new_optimizer, staged_optimizer_state)
+        restore_fsdp2_scheduler_state(new_scheduler, staged_scheduler_state)
 
         expected_model = _build_model()
         expected_optimizer = torch.optim.AdamW(expected_model.parameters(), lr=2e-3, weight_decay=0.03)
+        expected_scheduler = _build_scheduler(expected_optimizer)
         _optimizer_step(expected_model, expected_optimizer, step_index=0)
+        expected_scheduler.step()
         _assert_model_matches(new_model, expected_model)
         _assert_optimizer_matches(new_model, new_optimizer, expected_model, expected_optimizer)
+        assert new_scheduler.state_dict() == expected_scheduler.state_dict()
+        assert new_scheduler.get_last_lr() == expected_scheduler.get_last_lr()
 
         _optimizer_step(new_model, new_optimizer, step_index=1)
         _optimizer_step(expected_model, expected_optimizer, step_index=1)
+        new_scheduler.step()
+        expected_scheduler.step()
         _assert_model_matches(new_model, expected_model)
         _assert_optimizer_matches(new_model, new_optimizer, expected_model, expected_optimizer)
+        assert new_scheduler.state_dict() == expected_scheduler.state_dict()
+        assert new_scheduler.get_last_lr() == expected_scheduler.get_last_lr()
 
     dist.barrier()
     if rank == 0:
-        print(f"FSDP2 GPU-direct model and optimizer resize {old_world_size}->{new_world_size} passed")
+        print(f"FSDP2 GPU-direct training-state resize {old_world_size}->{new_world_size} passed")
     if rank in new_ranks:
         dist.destroy_process_group(new_group)
     dist.destroy_process_group()

@@ -969,6 +969,10 @@ alive. For AdamW this includes at least `exp_avg` and `exp_avg_sq`, so peak
 memory can include the old model and optimizer plus staged target model and
 optimizer shards.
 
+LR scheduler progress is transferred as replicated metadata in the same
+temporary communicator and restored after the optimizer. RNG state remains a
+separate continuation requirement.
+
 This prototype is not yet suitable for large models close to device capacity.
 Production hardening must add:
 

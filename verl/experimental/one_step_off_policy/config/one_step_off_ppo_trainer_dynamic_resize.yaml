@@ -55,7 +55,7 @@ trainer:
       enable: true
     handoff:
       enable: true
-      # Direct path: FSDP2, one-dimensional full shard, actor model and AdamW state.
+      # Direct path: FSDP2, one-dimensional full shard, actor model, AdamW, and LR scheduler state.
       # A full checkpoint is still written before commit and used on failure.
       backend: gpu_direct
       chunk_mb: 256

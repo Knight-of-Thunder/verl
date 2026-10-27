@@ -283,6 +283,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/handoff_optimizer_transfer_tensor_count": 0.0,
             "resize/handoff_optimizer_transfer_bytes": 0.0,
             "resize/handoff_optimizer_transfer_fallback_reason": "",
+            "resize/handoff_scheduler_transfer_status": "disabled",
+            "resize/handoff_scheduler_transfer_success": 0.0,
+            "resize/handoff_scheduler_transfer_state_entry_count": 0.0,
+            "resize/handoff_scheduler_transfer_fallback_reason": "",
         }
 
     def _build_resize_control_metrics(self, snapshot: dict[str, float | str | int]) -> dict[str, float | str | int]:
@@ -888,7 +892,14 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             )
         if transfer_optimizer and any(result.get("optimizer_status") != "staged" for result in target_results):
             raise RuntimeError("GPU-direct optimizer resize did not stage every target rank")
+        if transfer_optimizer and any(result.get("scheduler_status") != "staged" for result in target_results):
+            raise RuntimeError("GPU-direct scheduler resize did not stage every target rank")
         optimizer_total_bytes = sum(int(result.get("optimizer_staged_bytes", 0)) for result in target_results)
+        scheduler_state_entry_counts = {int(result.get("scheduler_state_entry_count", 0)) for result in target_results}
+        if len(scheduler_state_entry_counts) != 1:
+            raise RuntimeError(
+                f"GPU-direct scheduler resize returned inconsistent state entry counts: {scheduler_state_entry_counts}"
+            )
         logger.info(
             "[one-step-off][resize] staged actor model directly on %s ranks: tensors=%s bytes=%s",
             actor_target,
@@ -906,6 +917,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/handoff_optimizer_transfer_tensor_count": float(next(iter(optimizer_tensor_counts))),
             "resize/handoff_optimizer_transfer_bytes": float(optimizer_total_bytes),
             "resize/handoff_optimizer_transfer_fallback_reason": "",
+            "resize/handoff_scheduler_transfer_status": "staged" if transfer_optimizer else "disabled",
+            "resize/handoff_scheduler_transfer_success": 0.0,
+            "resize/handoff_scheduler_transfer_state_entry_count": float(next(iter(scheduler_state_entry_counts))),
+            "resize/handoff_scheduler_transfer_fallback_reason": "",
         }
 
     def _restore_gpu_direct_actor_model(self) -> dict[str, float | str | int]:
@@ -921,6 +936,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         optimizer_restored = all(result.get("optimizer_status") == "restored" for result in restored)
         if self._host_staging_config.stage_optimizer and not optimizer_restored:
             raise RuntimeError("GPU-direct optimizer resize did not restore every target rank")
+        scheduler_restored = all(result.get("scheduler_status") == "restored" for result in restored)
+        if self._host_staging_config.stage_optimizer and not scheduler_restored:
+            raise RuntimeError("GPU-direct scheduler resize did not restore every target rank")
+        scheduler_state_entry_count = max(int(result.get("scheduler_state_entry_count", 0)) for result in restored)
         logger.info(
             "[one-step-off][resize] restored actor model directly on %s ranks: tensors=%s bytes=%s",
             self.actor_wg.world_size,
@@ -940,6 +959,10 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             "resize/handoff_optimizer_transfer_tensor_count": float(optimizer_tensor_count),
             "resize/handoff_optimizer_transfer_bytes": float(optimizer_total_bytes),
             "resize/handoff_optimizer_transfer_fallback_reason": "",
+            "resize/handoff_scheduler_transfer_status": "restored" if scheduler_restored else "disabled",
+            "resize/handoff_scheduler_transfer_success": 1.0 if scheduler_restored else 0.0,
+            "resize/handoff_scheduler_transfer_state_entry_count": float(scheduler_state_entry_count),
+            "resize/handoff_scheduler_transfer_fallback_reason": "",
         }
 
     def _clear_gpu_direct_actor_model(self) -> None:
@@ -1209,6 +1232,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                         "resize/handoff_optimizer_transfer_status": "fallback",
                         "resize/handoff_optimizer_transfer_success": 0.0,
                         "resize/handoff_optimizer_transfer_fallback_reason": str(exc),
+                        "resize/handoff_scheduler_transfer_status": "fallback",
+                        "resize/handoff_scheduler_transfer_success": 0.0,
+                        "resize/handoff_scheduler_transfer_fallback_reason": str(exc),
                     }
                 )
 
@@ -1239,6 +1265,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                             "resize/handoff_optimizer_transfer_status": "fallback",
                             "resize/handoff_optimizer_transfer_success": 0.0,
                             "resize/handoff_optimizer_transfer_fallback_reason": str(exc),
+                            "resize/handoff_scheduler_transfer_status": "fallback",
+                            "resize/handoff_scheduler_transfer_success": 0.0,
+                            "resize/handoff_scheduler_transfer_fallback_reason": str(exc),
                         }
                     )
 
@@ -1249,7 +1278,13 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             model_transfer_metrics = {
                 key: value
                 for key, value in metrics.items()
-                if key.startswith(("resize/handoff_model_transfer_", "resize/handoff_optimizer_transfer_"))
+                if key.startswith(
+                    (
+                        "resize/handoff_model_transfer_",
+                        "resize/handoff_optimizer_transfer_",
+                        "resize/handoff_scheduler_transfer_",
+                    )
+                )
             }
             metrics.update(self._complete_dynamic_resize_handoff_session(checkpoint_step_folder))
             metrics.update(model_transfer_metrics)
